@@ -49,11 +49,10 @@ def unlock_and_launch_phone():
     try:
         # 1. Wake screen if asleep (KEYCODE_WAKEUP = 224)
         subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False)
-        time.sleep(0.3)
-        # 2. Dismiss keyguard (no password)
+        # 2. Dismiss keyguard cleanly via KEYCODE_MENU (82)
         subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False)
-        subprocess.run(["adb", "shell", "input", "swipe", "540", "1800", "540", "600", "200"], check=False)
-        time.sleep(0.4)
+        subprocess.run(["adb", "shell", "input", "keyevent", "82"], check=False)
+        time.sleep(0.3)
         # 3. Launch the app in foreground with fullscreen intent extra
         subprocess.run([
             "adb", "shell", "am", "start",
@@ -219,6 +218,7 @@ class MutterScreenSync:
 
             if (r, g, b) != self.last_rgb:
                 self.last_rgb = (r, g, b)
+                print(f"\r[*] Live Screen Sync -> RGB: ({r:3d}, {g:3d}, {b:3d}) | Vibe: {vibe:3d}   ", end="", flush=True)
 
         finally:
             buf.unmap(map_info)

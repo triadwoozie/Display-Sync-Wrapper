@@ -229,9 +229,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Non-linear color brightness boost using HSV space.
-     * Darker shades (v near 0) are barely boosted because v^2 is near zero.
-     * Lighter shades (v > 0.2) receive full quadratic gain and become vivid and bright.
+     * Perceptual gamma lift using HSV value channel.
+     * Pure black (v <= 0.005) remains strictly 0 (true OLED black preserved).
+     * Mid and darker desktop tones are lifted perceptually via gamma curve v^(1/boost)
+     * so that ambient glow is actually visible and vibrant.
      */
     private fun calculateBoostedColor(r: Int, g: Int, b: Int, boost: Float): Color {
         if (boost <= 1.0f) {
@@ -242,10 +243,11 @@ class MainActivity : ComponentActivity() {
         android.graphics.Color.RGBToHSV(r, g, b, hsv)
 
         val v = hsv[2] // Value [0..1]
-        // Quadratic weight ensures blacks stay black, while light tones soar:
-        val boostWeight = v * v
-        val boostedV = (v + (boost - 1.0f) * boostWeight).coerceIn(0f, 1f)
-        hsv[2] = boostedV
+        if (v > 0.005f) {
+            val gamma = 1.0f / boost
+            val boostedV = Math.pow(v.toDouble(), gamma.toDouble()).toFloat().coerceIn(0f, 1f)
+            hsv[2] = boostedV
+        }
 
         val colorInt = android.graphics.Color.HSVToColor(hsv)
         return Color(colorInt)
