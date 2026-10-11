@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Android & Gradle Build Artifacts
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Interception tools build artifacts
+gitlab/tools/intercept
+gitlab/tools/build/
+
+# System / IDE
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+*.iml

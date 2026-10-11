@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Deep Dark Theme -->
+    <color name="background_dark">#0A0A0F</color>
+    <color name="surface_dark">#14141F</color>
+    <color name="surface_elevated">#1E1E2E</color>
+    
+    <!-- Accent Colors - Electric Amber -->
+    <color name="primary">#FFB800</color>
+    <color name="primary_variant">#FF9500</color>
+    <color name="primary_glow">#33FFB800</color>
+    <color name="primary_dim">#66FFB800</color>
+    
+    <!-- Light States -->
+    <color name="light_off">#2A2A3A</color>
+    <color name="light_on">#FFFEF0</color>
+    <color name="light_glow">#80FFFEF0</color>
+    
+    <!-- Text Colors -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#8A8A9A</color>
+    <color name="text_dim">#4A4A5A</color>
+    
+    <!-- Slider Track -->
+    <color name="slider_track_inactive">#2A2A3A</color>
+    <color name="slider_track_active">#FFB800</color>
+    
+    <!-- Level Indicators -->
+    <color name="level_inactive">#3A3A4A</color>
+    <color name="level_active">#FFB800</color>
+</resources>
+

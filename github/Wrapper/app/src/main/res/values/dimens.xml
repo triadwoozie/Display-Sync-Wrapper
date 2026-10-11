@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="power_button_size">200dp</dimen>
+    <dimen name="power_button_icon_size">80dp</dimen>
+    <dimen name="glow_radius">120dp</dimen>
+    <dimen name="slider_height">60dp</dimen>
+    <dimen name="level_indicator_size">12dp</dimen>
+    <dimen name="spacing_large">32dp</dimen>
+    <dimen name="spacing_medium">16dp</dimen>
+    <dimen name="spacing_small">8dp</dimen>
+    <dimen name="corner_radius">24dp</dimen>
+    <dimen name="corner_radius_large">40dp</dimen>
+</resources>
+

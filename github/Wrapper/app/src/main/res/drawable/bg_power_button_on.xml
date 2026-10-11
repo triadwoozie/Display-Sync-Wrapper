@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Glow effect -->
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/primary_glow" />
+        </shape>
+    </item>
+    <!-- Outer ring -->
+    <item
+        android:bottom="20dp"
+        android:left="20dp"
+        android:right="20dp"
+        android:top="20dp">
+        <shape android:shape="oval">
+            <stroke
+                android:width="4dp"
+                android:color="@color/primary" />
+            <solid android:color="@android:color/transparent" />
+        </shape>
+    </item>
+    <!-- Inner fill -->
+    <item
+        android:bottom="26dp"
+        android:left="26dp"
+        android:right="26dp"
+        android:top="26dp">
+        <shape android:shape="oval">
+            <solid android:color="@color/surface_elevated" />
+        </shape>
+    </item>
+</layer-list>
+
