@@ -2,16 +2,20 @@
 """
 Mutter ScreenCast (PipeWire) Downscaled-at-the-Source Display Sync & Rumble Interceptor
 ---------------------------------------------------------------------------------------
+- Unlocks phone, launches app, and taps to enter fullscreen mode automatically on start.
 - Negotiates 16x9 (144 pixels) directly with Mutter / PipeWire inside the compositor pass.
 - Vectorized NumPy mean over 144 pixels (virtually 0% CPU overhead).
 - Intercepts controller force-feedback rumble events (EV_FF).
 - Streams 4-byte payload [R, G, B, VIBRATION] over ADB USB (tcp:5555).
+- On exit (Ctrl-C or close): cleanly closes app, turns off phone screen, and exits.
 """
 
 import sys
 import os
 import time
 import socket
+import signal
+import atexit
 import argparse
 import threading
 import subprocess
@@ -36,6 +40,59 @@ HEIGHT = 9
 
 current_vibration = 0
 vibration_lock = threading.Lock()
+is_cleaning_up = False
+
+
+def unlock_and_launch_phone():
+    """Wakes the phone, dismisses the lockscreen, and launches the app via ADB."""
+    print("[*] Waking phone, unlocking, and launching app via ADB...")
+    try:
+        # 1. Wake screen if asleep
+        subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False)
+        time.sleep(0.2)
+        # 2. Dismiss keyguard (no password)
+        subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False)
+        subprocess.run(["adb", "shell", "input", "swipe", "540", "1800", "540", "600", "200"], check=False)
+        time.sleep(0.3)
+        # 3. Launch the app
+        subprocess.run(["adb", "shell", "am", "start", "-n", "com.flashlight.torch/.MainActivity"], check=False)
+        print("[+] Phone unlocked and app launched.")
+    except Exception as e:
+        print(f"[!] Warning: ADB unlock/launch failed: {e}")
+
+
+def dismiss_initial_ui():
+    """Taps the screen after connection to dismiss the initial UI and enter fullscreen."""
+    def _tap():
+        time.sleep(1.2)
+        print("[*] Tapping screen to enter fullscreen mode...")
+        try:
+            subprocess.run(["adb", "shell", "input", "tap", "540", "200"], check=False)
+        except Exception:
+            pass
+
+    threading.Thread(target=_tap, daemon=True).start()
+
+
+def cleanup_phone_and_exit(sync_instance=None):
+    """Turns off phone screen, closes app, stops pipeline, and exits."""
+    global is_cleaning_up
+    if is_cleaning_up:
+        return
+    is_cleaning_up = True
+
+    print("\n[*] Shutting down: closing app and turning off phone screen...")
+    try:
+        # Force-stop the app
+        subprocess.run(["adb", "shell", "am", "force-stop", "com.flashlight.torch"], check=False)
+        # Put phone screen to sleep
+        subprocess.run(["adb", "shell", "input", "keyevent", "223"], check=False)
+        print("[+] Phone screen turned off and app closed.")
+    except Exception as e:
+        print(f"[!] Warning: ADB cleanup failed: {e}")
+
+    if sync_instance:
+        sync_instance.stop()
 
 
 def setup_adb_forward(port: int):
@@ -97,9 +154,10 @@ def monitor_controller_vibration(device_path=None, simulate=False):
 
 
 class MutterScreenSync:
-    def __init__(self, port=PORT, fps=FPS_TARGET):
+    def __init__(self, port=PORT, fps=FPS_TARGET, auto_dismiss_ui=True):
         self.port = port
         self.fps = fps
+        self.auto_dismiss_ui = auto_dismiss_ui
         self.sock = None
         self.pipeline = None
         self.loop = GLib.MainLoop()
@@ -116,6 +174,8 @@ class MutterScreenSync:
                 s.connect((HOST, self.port))
                 self.sock = s
                 print("[+] Connected to Android app!")
+                if self.auto_dismiss_ui:
+                    dismiss_initial_ui()
                 break
             except (ConnectionRefusedError, OSError):
                 time.sleep(1.0)
@@ -131,7 +191,7 @@ class MutterScreenSync:
             return Gst.FlowReturn.OK
 
         try:
-            # 16x9 x 3 bytes RGB = 432 bytes total!
+            # 16x9 x 3 bytes RGB = 432 bytes total
             arr = np.frombuffer(map_info.data, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
             avg_rgb = arr.mean(axis=(0, 1)).astype(np.uint8)
             r, g, b = int(avg_rgb[0]), int(avg_rgb[1]), int(avg_rgb[2])
@@ -155,8 +215,6 @@ class MutterScreenSync:
 
             if (r, g, b) != self.last_rgb:
                 self.last_rgb = (r, g, b)
-                # print concise stream info
-                print(f"[*] Wayland Screen: RGB=({r:3d}, {g:3d}, {b:3d}) | Vibe={vibe}")
 
         finally:
             buf.unmap(map_info)
@@ -176,6 +234,28 @@ class MutterScreenSync:
         sink.connect('new-sample', self.on_new_sample)
         self.pipeline.set_state(Gst.State.PLAYING)
         print(f"[+] PipeWire pipeline running (Downscaled to {WIDTH}x{HEIGHT} at source).")
+
+    def stop(self):
+        try:
+            if self.loop.is_running():
+                self.loop.quit()
+        except Exception:
+            pass
+        if self.pipeline:
+            try:
+                self.pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+        if self.sess_proxy:
+            try:
+                self.sess_proxy.call_sync('Stop', None, Gio.DBusCallFlags.NONE, -1, None)
+            except Exception:
+                pass
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
     def run(self):
         Gst.init(None)
@@ -225,20 +305,10 @@ class MutterScreenSync:
         try:
             self.loop.run()
         except KeyboardInterrupt:
-            print("\n[*] Stopping sync...")
+            pass
         finally:
-            if self.pipeline:
-                self.pipeline.set_state(Gst.State.NULL)
-            if self.sess_proxy:
-                try:
-                    self.sess_proxy.call_sync('Stop', None, Gio.DBusCallFlags.NONE, -1, None)
-                except Exception:
-                    pass
-            if self.sock:
-                try:
-                    self.sock.close()
-                except Exception:
-                    pass
+            self.stop()
+            cleanup_phone_and_exit(self)
 
 
 def main():
@@ -247,8 +317,26 @@ def main():
     parser.add_argument("--fps", type=int, default=FPS_TARGET)
     parser.add_argument("--simulate-vibration", action="store_true")
     parser.add_argument("--controller", type=str, default=None)
+    parser.add_argument("--no-unlock", action="store_true", help="Skip waking/unlocking phone on launch")
+    parser.add_argument("--no-dismiss-ui", action="store_true", help="Do not auto-tap to enter fullscreen")
     args = parser.parse_args()
 
+    # 1. Unlock phone and launch app unless skipped
+    if not args.no_unlock:
+        unlock_and_launch_phone()
+
+    sync = MutterScreenSync(port=args.port, fps=args.fps, auto_dismiss_ui=not args.no_dismiss_ui)
+
+    # 2. Register signal handlers for clean exit on Ctrl-C or SIGTERM
+    def sig_handler(sig, frame):
+        cleanup_phone_and_exit(sync)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+    atexit.register(cleanup_phone_and_exit, sync)
+
+    # 3. Start rumble monitoring
     vibe_thread = threading.Thread(
         target=monitor_controller_vibration,
         args=(args.controller, args.simulate_vibration),
@@ -256,7 +344,7 @@ def main():
     )
     vibe_thread.start()
 
-    sync = MutterScreenSync(port=args.port, fps=args.fps)
+    # 4. Start sync loop
     sync.run()
 
 
