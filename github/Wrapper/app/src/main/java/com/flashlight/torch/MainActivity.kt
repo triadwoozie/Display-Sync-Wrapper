@@ -169,23 +169,21 @@ class MainActivity : ComponentActivity() {
         val manager = cameraManager ?: return
 
         try {
+            var fallbackId: String? = null
             for (id in manager.cameraIdList) {
                 val characteristics = manager.getCameraCharacteristics(id)
                 val hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
                 if (hasFlash) {
-                    cameraId = id
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        val maxLevel = characteristics.get(
-                            CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL
-                        ) ?: 1
-                        if (maxLevel > 1) {
-                            supportsBrightnessControl = true
-                            maxBrightnessLevel = maxLevel
-                        }
+                    val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                    if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                        cameraId = id
+                        break
+                    } else if (fallbackId == null) {
+                        fallbackId = id
                     }
-                    break
                 }
             }
+            if (cameraId == null) cameraId = fallbackId
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -208,15 +206,10 @@ class MainActivity : ComponentActivity() {
 
         try {
             if (vibrationIntensity > 0) {
-                if (supportsBrightnessControl && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    val safeLevel = ((vibrationIntensity / 255f) * maxBrightnessLevel)
-                        .toInt()
-                        .coerceIn(1, maxBrightnessLevel)
-                    manager.turnOnTorchWithStrengthLevel(id, safeLevel)
-                } else {
+                if (!isTorchOn) {
                     manager.setTorchMode(id, true)
+                    isTorchOn = true
                 }
-                isTorchOn = true
             } else {
                 if (isTorchOn) {
                     manager.setTorchMode(id, false)
