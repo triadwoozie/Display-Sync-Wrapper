@@ -44,34 +44,38 @@ is_cleaning_up = False
 
 
 def unlock_and_launch_phone():
-    """Wakes the phone, dismisses the lockscreen, and launches the app via ADB."""
+    """Wakes the phone, dismisses the lockscreen, and launches the app in fullscreen via ADB."""
     print("[*] Waking phone, unlocking, and launching app via ADB...")
     try:
-        # 1. Wake screen if asleep
+        # 1. Wake screen if asleep (KEYCODE_WAKEUP = 224)
         subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False)
-        time.sleep(0.2)
+        time.sleep(0.3)
         # 2. Dismiss keyguard (no password)
         subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False)
         subprocess.run(["adb", "shell", "input", "swipe", "540", "1800", "540", "600", "200"], check=False)
-        time.sleep(0.3)
-        # 3. Launch the app
-        subprocess.run(["adb", "shell", "am", "start", "-n", "com.flashlight.torch/.MainActivity"], check=False)
-        print("[+] Phone unlocked and app launched.")
+        time.sleep(0.4)
+        # 3. Launch the app in foreground with fullscreen intent extra
+        subprocess.run([
+            "adb", "shell", "am", "start",
+            "-W",
+            "-a", "android.intent.action.MAIN",
+            "-c", "android.intent.category.LAUNCHER",
+            "-n", "com.flashlight.torch/.MainActivity",
+            "--ez", "hide_controls", "true"
+        ], check=False)
+        # 4. Broadcast HIDE_UI to ensure fullscreen
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False)
+        print("[+] Phone unlocked and app running in fullscreen ambient mode.")
     except Exception as e:
         print(f"[!] Warning: ADB unlock/launch failed: {e}")
 
 
 def dismiss_initial_ui():
-    """Taps the screen after connection to dismiss the initial UI and enter fullscreen."""
-    def _tap():
-        time.sleep(1.2)
-        print("[*] Tapping screen to enter fullscreen mode...")
-        try:
-            subprocess.run(["adb", "shell", "input", "tap", "540", "200"], check=False)
-        except Exception:
-            pass
-
-    threading.Thread(target=_tap, daemon=True).start()
+    """Ensures controls are hidden in the app upon connection."""
+    try:
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False)
+    except Exception:
+        pass
 
 
 def cleanup_phone_and_exit(sync_instance=None):
@@ -328,12 +332,19 @@ def main():
     sync = MutterScreenSync(port=args.port, fps=args.fps, auto_dismiss_ui=not args.no_dismiss_ui)
 
     # 2. Register signal handlers for clean exit on Ctrl-C or SIGTERM
-    def sig_handler(sig, frame):
+    def sig_handler(*_):
         cleanup_phone_and_exit(sync)
+        if sync.loop and sync.loop.is_running():
+            sync.loop.quit()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
+    try:
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sig_handler)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sig_handler)
+    except Exception:
+        pass
     atexit.register(cleanup_phone_and_exit, sync)
 
     # 3. Start rumble monitoring

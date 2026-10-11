@@ -5,6 +5,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -64,8 +67,19 @@ class MainActivity : ComponentActivity() {
     private val packetCountState = mutableLongStateOf(0L)
     private val hasCameraPermissionState = mutableStateOf(false)
     private val selectedModeState = mutableStateOf(SyncMode.BOTH)
-    private val isControlsVisibleState = mutableStateOf(true)
+    private val isControlsVisibleState = mutableStateOf(false)
     private val colorBoostFactorState = mutableFloatStateOf(2.0f)
+
+    // --- ADB UI Control Receiver ---
+    private val uiControlReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                "com.flashlight.torch.HIDE_UI" -> isControlsVisibleState.value = false
+                "com.flashlight.torch.SHOW_UI" -> isControlsVisibleState.value = true
+                "com.flashlight.torch.TOGGLE_UI" -> isControlsVisibleState.value = !isControlsVisibleState.value
+            }
+        }
+    }
 
     // --- Burn-in Tracking ---
     private var baseColor = Color.Black
@@ -109,6 +123,19 @@ class MainActivity : ComponentActivity() {
         } else {
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
+
+        // Register ADB UI control receiver
+        val filter = IntentFilter().apply {
+            addAction("com.flashlight.torch.HIDE_UI")
+            addAction("com.flashlight.torch.SHOW_UI")
+            addAction("com.flashlight.torch.TOGGLE_UI")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(uiControlReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(uiControlReceiver, filter)
+        }
+        handleIntent(intent)
 
         // Start background socket listener & burn-in ticker
         startNetworkListener()
@@ -304,6 +331,7 @@ class MainActivity : ComponentActivity() {
 
                         withContext(Dispatchers.Main) {
                             isConnectedState.value = true
+                            isControlsVisibleState.value = false
                         }
 
                         val packet = ByteArray(4)
@@ -344,8 +372,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        if (intent != null && intent.hasExtra("hide_controls")) {
+            isControlsVisibleState.value = !intent.getBooleanExtra("hide_controls", true)
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        try {
+            unregisterReceiver(uiControlReceiver)
+        } catch (e: Exception) {}
         serverJob?.cancel()
         updateTorchState(0)
     }
