@@ -109,7 +109,7 @@ def setup_adb_forward(port: int):
 
 
 def monitor_controller_vibration(device_path=None, simulate=False):
-    """Listens for gamepad rumble events (EV_FF)."""
+    """Listens for gamepad rumble events (EV_FF) with hotplug support and pulse decay."""
     global current_vibration
 
     if simulate:
@@ -126,34 +126,54 @@ def monitor_controller_vibration(device_path=None, simulate=False):
     if not HAS_EVDEV:
         return
 
-    target_devices = []
-    try:
-        paths = evdev.list_devices() if not device_path else [device_path]
-        for p in paths:
-            try:
-                dev = evdev.InputDevice(p)
-                if evdev.ecodes.EV_FF in dev.capabilities():
-                    target_devices.append(dev)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    if not target_devices:
-        return
-
     import select
+    last_vibe_time = 0
+
     while True:
+        target_devices = []
         try:
-            r, _, _ = select.select(target_devices, [], [], 1.0)
-            for dev in r:
-                for ev in dev.read():
-                    if ev.type == evdev.ecodes.EV_FF:
-                        val = 255 if ev.value > 0 else 0
-                        with vibration_lock:
-                            current_vibration = val
+            paths = evdev.list_devices() if not device_path else [device_path]
+            for p in paths:
+                try:
+                    dev = evdev.InputDevice(p)
+                    if evdev.ecodes.EV_FF in dev.capabilities():
+                        target_devices.append(dev)
+                except Exception:
+                    pass
         except Exception:
-            time.sleep(1.0)
+            pass
+
+        if not target_devices:
+            time.sleep(1.5)
+            continue
+
+        print(f"[+] Controller rumble active on: {[d.name for d in target_devices]}")
+
+        while True:
+            try:
+                r, _, _ = select.select(target_devices, [], [], 0.1)
+                now = time.time()
+                if r:
+                    for dev in r:
+                        for ev in dev.read():
+                            if ev.type == evdev.ecodes.EV_FF:
+                                if ev.value > 0:
+                                    last_vibe_time = now
+                                    with vibration_lock:
+                                        current_vibration = 255
+                                else:
+                                    with vibration_lock:
+                                        current_vibration = 0
+
+                # Auto-decay rumble pulse after 350ms if no continuous events
+                if current_vibration > 0 and (now - last_vibe_time > 0.35):
+                    with vibration_lock:
+                        current_vibration = 0
+
+            except (OSError, IOError):
+                # Device unplugged or state reset
+                time.sleep(1.0)
+                break
 
 
 class MutterScreenSync:
