@@ -522,8 +522,8 @@ class TuyaBulbSync:
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
         self.saturation_boost = float(self.config.get("saturation_boost", 1.8))
-        self.alpha = float(self.config.get("smoothing_alpha", 0.50))
-        self.local_hz = float(self.config.get("local_refresh_hz", 20.0))
+        self.alpha = float(self.config.get("smoothing_alpha", 0.20))
+        self.local_hz = float(self.config.get("local_refresh_hz", 25.0))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -533,15 +533,17 @@ class TuyaBulbSync:
 
         # Target color from screen frame in RGB space [0.0 .. 1.0]
         self.target_r = 1.0
-        self.target_g = 0.85
-        self.target_b = 0.70
+        self.target_g = 1.0
+        self.target_b = 1.0
         self.target_lum = 0.5
+        self.target_peak = 0.5
+        self.target_bloom = 0.0
 
         # Current smoothed color state in RGB space
         self.curr_r = 1.0
-        self.curr_g = 0.85
-        self.curr_b = 0.70
-        self.curr_lum = 0.5
+        self.curr_g = 1.0
+        self.curr_b = 1.0
+        self.curr_v = float(self.brightness * 10)
         self.last_sent_hsv = (-1, -1, -1)
         self.current_display_b = self.brightness
 
@@ -673,9 +675,8 @@ class TuyaBulbSync:
 
     def update_frame(self, arr: np.ndarray):
         """
-        Extracts dominant color in RGB space and screen luminance for dynamic lighting.
-        Linear RGB cross-fading smoothly transitions the two colors directly without
-        cycling through intermediate rainbow hues.
+        Extracts natural screen average RGB, ambient luminance, and saturated bloom highlights.
+        Zero-allocation via pre-allocated float32 buffer.
         """
         if not self.enabled or self.white_mode:
             return
@@ -687,6 +688,12 @@ class TuyaBulbSync:
             g = self._rgb_f32[..., 1]
             b = self._rgb_f32[..., 2]
 
+            # Natural screen average RGB (directly reflects monitor colors & whites)
+            avg_r = float(np.mean(r))
+            avg_g = float(np.mean(g))
+            avg_b = float(np.mean(b))
+
+            # Per-pixel value and saturation for bloom & peak detection
             cmax = np.maximum(np.maximum(r, g), b)
             cmin = np.minimum(np.minimum(r, g), b)
             delta = cmax - cmin
@@ -695,64 +702,30 @@ class TuyaBulbSync:
             mask_nz = cmax > 0.001
             sat[mask_nz] = delta[mask_nz] / cmax[mask_nz]
 
-            # Perceived screen luminance for dynamic brightness
-            luminance = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
+            # 1. Overall ambient luminance
+            mean_lum = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
 
-            # Peak saturation on screen
-            max_s = float(np.max(sat))
+            # 2. Peak luminance in scene
+            peak_lum = float(np.max(0.299 * r + 0.587 * g + 0.114 * b))
 
-            # Weight pixels by sat^3 * cmax + 0.005 so colored pixels overpower background
-            weights = (sat ** 3) * cmax + 0.005
-            w_sum = weights.sum()
-            if w_sum > 0:
-                weights /= w_sum
-            else:
-                weights = np.full_like(weights, 1.0 / weights.size)
-
-            wr = float(np.sum(weights * r))
-            wg = float(np.sum(weights * g))
-            wb = float(np.sum(weights * b))
-
-            w_max = max(wr, wg, wb)
-            w_min = min(wr, wg, wb)
-            w_delta = w_max - w_min
-
-            # If color is present on screen (max_s >= 0.05 or weighted saturation >= 0.03):
-            # Scale to vibrant saturated color (85%-100% saturation)
-            if max_s >= 0.05 or (w_max > 1e-4 and (w_delta / w_max) >= 0.03):
-                if w_max > 1e-5:
-                    tr = wr / w_max
-                    tg = wg / w_max
-                    tb = wb / w_max
-                else:
-                    tr, tg, tb = 1.0, 0.85, 0.70
-
-                t_min = min(tr, tg, tb)
-                if t_min > 0:
-                    tr = max(0.0, tr - t_min * 0.85)
-                    tg = max(0.0, tg - t_min * 0.85)
-                    tb = max(0.0, tb - t_min * 0.85)
-                    norm = max(tr, tg, tb)
-                    if norm > 1e-5:
-                        tr /= norm
-                        tg /= norm
-                        tb /= norm
-            else:
-                # Truly monochrome / text / dark: soft warm incandescent white
-                tr, tg, tb = 1.0, 0.85, 0.70
+            # 3. Bloom / vibrant saturated highlight intensity (so neon/lasers/sparks shine bright)
+            bloom_score = float(np.max(sat * cmax))
 
             with self.lock:
-                self.target_r = tr
-                self.target_g = tg
-                self.target_b = tb
-                self.target_lum = luminance
+                self.target_r = avg_r
+                self.target_g = avg_g
+                self.target_b = avg_b
+                self.target_lum = mean_lum
+                self.target_peak = peak_lum
+                self.target_bloom = bloom_score
         except Exception:
             pass
 
     def _gradient_sync_loop(self):
         """
         Runs smooth direct color cross-fade in RGB space towards target frame
-        and streams to the bulb over persistent TCP socket (or rate-limited Cloud fallback).
+        and smoothly eases dynamic brightness as a gradient.
+        Streams to the bulb over persistent TCP socket (or rate-limited Cloud fallback).
         """
         time.sleep(0.5)
         while self.running:
@@ -774,6 +747,8 @@ class TuyaBulbSync:
                 tg = self.target_g
                 tb = self.target_b
                 tlum = self.target_lum
+                tpeak = self.target_peak
+                tbloom = self.target_bloom
                 w_temp = self.white_temp
 
             # If Bulb is in Normal White Mode:
@@ -793,30 +768,36 @@ class TuyaBulbSync:
                         self.last_sent_white = b_val
                 continue
 
-            # Display Sync Mode (RGB linear cross-fade):
+            # Display Sync Mode (Eased RGB linear cross-fade):
             # 1. Smooth RGB channels directly
             self.curr_r += alpha * (tr - self.curr_r)
             self.curr_g += alpha * (tg - self.curr_g)
             self.curr_b += alpha * (tb - self.curr_b)
-            self.curr_lum += alpha * (tlum - self.curr_lum)
 
             # 2. Dynamic brightness target:
+            # Combines ambient screen luminance, peak highlights, and bloom score
+            # Saturated highlights and bloom keep brightness up during games/dark scenes
             if dyn:
-                lum_factor = max(0.0, min(1.0, self.curr_lum)) ** 1.8
+                eff_light = max(tlum, 0.40 * tpeak, 0.50 * tbloom)
+                lum_factor = max(0.0, min(1.0, eff_light)) ** 0.85
                 eff_brightness = min_b + (bright_pct - min_b) * lum_factor
                 target_v = max(float(min_b), min(float(max_b), eff_brightness))
             else:
                 target_v = float(bright_pct)
 
-            # 3. Convert smoothed RGB to Tuya HSV
+            # Smooth brightness as an eased gradient (no abrupt jumps)
+            target_v_tuya = target_v * 10.0
+            self.curr_v += alpha * (target_v_tuya - self.curr_v)
+
+            # 3. Convert smoothed RGB to natural Tuya HSV
             cr, cg, cb = self.curr_r, self.curr_g, self.curr_b
             cmax = max(cr, cg, cb)
             cmin = min(cr, cg, cb)
             delta = cmax - cmin
 
             if delta < 1e-4 or cmax < 1e-4:
-                h_tuya = 32
-                s_tuya = 100
+                h_tuya = 0
+                s_tuya = 0
             else:
                 if cmax == cr:
                     h = ((cg - cb) / delta) % 6.0
@@ -827,14 +808,15 @@ class TuyaBulbSync:
                 h_tuya = int((h * 60.0) % 360.0)
 
                 s_raw = delta / cmax
-                if s_raw < 0.08:
-                    s_tuya = 100
-                    h_tuya = 32
+                # If saturation is very low (< 6%), display clean pure white (no sickly off-white tint)
+                if s_raw < 0.06:
+                    s_tuya = 0
+                    h_tuya = 0
                 else:
-                    progress = min(1.0, (s_raw - 0.08) / 0.35)
-                    s_tuya = int(850 + 150 * progress)
+                    # Natural saturation matching the screen
+                    s_tuya = int(min(1000, s_raw * 1000))
 
-            v_tuya = int(max(min_b * 10, min(1000, target_v * 10)))
+            v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
             self.current_display_b = int(v_tuya / 10)
 
             # 4. Deadband check: send if changed
