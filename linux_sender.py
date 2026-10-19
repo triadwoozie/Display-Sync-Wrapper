@@ -47,7 +47,7 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 5555
-FPS_TARGET = 30
+FPS_TARGET = 60
 
 WIDTH = 16
 HEIGHT = 9
@@ -821,7 +821,7 @@ class TuyaBulbSync:
             "white_mode": False,
             "white_temp": 500,
             "saturation_boost": 1.8,
-            "smoothing_alpha": 0.45,
+            "smoothing_alpha": 0.65,
             "local_refresh_hz": 15.0,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
@@ -858,6 +858,32 @@ class TuyaBulbSync:
             self.local_hz = clamped
             self.config["local_refresh_hz"] = clamped
         self.save_config()
+
+    def set_smoothing_alpha(self, alpha: float):
+        clamped = max(0.20, min(0.95, float(alpha)))
+        with self.lock:
+            self.alpha = clamped
+            self.config["smoothing_alpha"] = clamped
+        self.save_config()
+
+    def force_reconnect(self) -> bool:
+        if self.local_device:
+            self.local_device.disconnect()
+            eth = get_ethernet_ip()
+            if self.use_ethernet_only:
+                self.ethernet_ip = eth
+                self.local_device.set_bind_ip(eth)
+            else:
+                self.local_device.set_bind_ip(None)
+            success = self.local_device.connect()
+            if success:
+                self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
+            elif self.cloud_client:
+                self.mode = "Cloud OpenAPI"
+            else:
+                self.mode = "Disconnected"
+            return success
+        return False
 
     def set_dynamic_brightness(self, enable: bool):
         with self.lock:
@@ -1034,11 +1060,13 @@ class TuyaBulbSync:
                         self.last_sent_white = b_val
                 continue
 
-            # Display Sync Mode (Eased RGB linear cross-fade):
-            # 1. Smooth RGB channels directly
-            self.curr_r += alpha * (tr - self.curr_r)
-            self.curr_g += alpha * (tg - self.curr_g)
-            self.curr_b += alpha * (tb - self.curr_b)
+            # Display Sync Mode (Eased RGB linear cross-fade with adaptive snappiness):
+            # 1. Smooth RGB channels directly (large scene cuts & flashes snap fast, subtle changes ease softly)
+            color_delta = max(abs(tr - self.curr_r), abs(tg - self.curr_g), abs(tb - self.curr_b))
+            eff_alpha = min(0.95, alpha * 1.5) if color_delta > 0.15 else alpha
+            self.curr_r += eff_alpha * (tr - self.curr_r)
+            self.curr_g += eff_alpha * (tg - self.curr_g)
+            self.curr_b += eff_alpha * (tb - self.curr_b)
 
             # 2. Dynamic brightness target:
             # - On pure white: pushes all the way to 100% brightness
@@ -1068,9 +1096,11 @@ class TuyaBulbSync:
             else:
                 target_v = float(bright_pct)
 
-            # Smooth brightness as an eased gradient (no abrupt jumps)
+            # Smooth brightness as an eased gradient with adaptive snappiness
             target_v_tuya = target_v * 10.0
-            self.curr_v += alpha * (target_v_tuya - self.curr_v)
+            v_delta = abs(target_v_tuya - self.curr_v) / 1000.0
+            eff_alpha_v = min(0.95, alpha * 1.5) if v_delta > 0.15 else alpha
+            self.curr_v += eff_alpha_v * (target_v_tuya - self.curr_v)
 
             # 3. Convert smoothed RGB to natural Tuya HSV
             cr, cg, cb = self.curr_r, self.curr_g, self.curr_b
@@ -1191,6 +1221,7 @@ class TuyaBulbSync:
                         eth = sync_self.use_ethernet_only
                         power = sync_self.power_on
                         cur_hz = sync_self.local_hz
+                        cur_alpha = sync_self.alpha
                         mode_str = sync_self.mode
                         if not power:
                             r_d, g_d, b_d = 40, 40, 40
@@ -1211,6 +1242,7 @@ class TuyaBulbSync:
                     power_checked = "checked" if power else ""
                     hz_options = [10, 12, 14, 15, 18, 20]
                     hz_options_html = "".join([f'<option value="{opt}"{" selected" if int(round(cur_hz)) == opt else ""}>{opt} Hz</option>' for opt in hz_options])
+                    alpha_pct = int(round(cur_alpha * 100))
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1282,6 +1314,26 @@ class TuyaBulbSync:
             margin: 8px 0;
             font-size: 13px;
         }}
+        .btn-reconnect {{
+            width: 100%;
+            background: rgba(255, 179, 0, 0.12);
+            color: #ffb300;
+            border: 1px solid rgba(255, 179, 0, 0.35);
+            border-radius: 12px;
+            padding: 10px 14px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            margin: 8px 0;
+            transition: all 0.2s ease;
+        }}
+        .btn-reconnect:hover {{
+            background: rgba(255, 179, 0, 0.22);
+            border-color: #ffb300;
+        }}
+        .btn-reconnect:active {{
+            transform: scale(0.98);
+        }}
         .sub {{
             color: rgba(255,255,255,0.45);
             font-size: 11px;
@@ -1302,12 +1354,18 @@ class TuyaBulbSync:
             <span style="font-weight: 600; color: #ffb300;">💡 Bulb Power</span>
             <input type="checkbox" id="power-toggle" {power_checked} onchange="togglePower(this.checked)">
         </div>
+        <button id="reconnect-btn" class="btn-reconnect" onclick="reconnectBulb()">🔄 Reconnect Bulb</button>
         <div class="toggle-box">
             <span>Refresh Rate</span>
             <select id="hz-select" style="background:#282836; color:#ffb300; border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:3px 8px; font-weight:bold; outline:none; font-size:12px;" onchange="updateHz(this.value)">
                 {hz_options_html}
             </select>
         </div>
+        <div class="toggle-box">
+            <span>Responsiveness (Speed)</span>
+            <span id="alpha-val" style="font-weight:bold; color:#ffb300;">{alpha_pct}%</span>
+        </div>
+        <input type="range" min="30" max="95" value="{alpha_pct}" id="alpha-slider" oninput="updateAlpha(this.value)">
         <div class="toggle-box">
             <span>Ethernet Only (Isolate Hotspot)</span>
             <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
@@ -1334,6 +1392,25 @@ class TuyaBulbSync:
         function updateHz(v) {{
             fetch('/refresh_hz?val=' + v);
         }}
+        function updateAlpha(v) {{
+            document.getElementById('alpha-val').innerText = v + '%';
+            fetch('/smoothing?val=' + v);
+        }}
+        function reconnectBulb() {{
+            let btn = document.getElementById('reconnect-btn');
+            if (btn) btn.innerText = 'Connecting...';
+            fetch('/reconnect')
+                .then(r => r.json())
+                .then(d => {{
+                    if (btn) btn.innerText = d.status === 'ok' ? '✓ Connected' : '✕ Reconnect Failed';
+                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
+                    fetchStatus();
+                }})
+                .catch(() => {{
+                    if (btn) btn.innerText = '✕ Error';
+                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
+                }});
+        }}
         function togglePower(checked) {{
             fetch('/power_toggle?val=' + (checked ? '1' : '0'));
         }}
@@ -1359,6 +1436,12 @@ class TuyaBulbSync:
                 let hzSelect = document.getElementById('hz-select');
                 if (hzSelect && document.activeElement !== hzSelect && d.refresh_hz) {{
                     hzSelect.value = String(Math.round(d.refresh_hz));
+                }}
+                let aSlider = document.getElementById('alpha-slider');
+                if (aSlider && document.activeElement !== aSlider && d.smoothing_alpha) {{
+                    let pct = Math.round(d.smoothing_alpha * 100);
+                    aSlider.value = pct;
+                    document.getElementById('alpha-val').innerText = pct + '%';
                 }}
             }} catch(e) {{}}
         }}
@@ -1394,6 +1477,25 @@ class TuyaBulbSync:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/smoothing":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        try:
+                            sync_self.set_smoothing_alpha(float(qs["val"][0]) / 100.0)
+                        except Exception:
+                            pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/reconnect":
+                    ok = sync_self.force_reconnect()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}' if ok else b'{"status":"failed"}')
 
                 elif parsed.path == "/power_toggle":
                     qs = parse_qs(parsed.query)
@@ -1450,6 +1552,7 @@ class TuyaBulbSync:
                         eth_ip = sync_self.ethernet_ip
                         power = sync_self.power_on
                         cur_hz = sync_self.local_hz
+                        cur_alpha = sync_self.alpha
                         mode_str = sync_self.mode
                         if not power:
                             r_d, g_d, b_d = 40, 40, 40
@@ -1475,6 +1578,7 @@ class TuyaBulbSync:
                         "ethernet_ip": eth_ip,
                         "power": power,
                         "refresh_hz": cur_hz,
+                        "smoothing_alpha": cur_alpha,
                         "mode": display_mode,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
