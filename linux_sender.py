@@ -209,20 +209,110 @@ def monitor_controller_vibration(device_path=None, simulate=False):
 # Tuya Local (Wi-Fi Persistent Socket) & Cloud API Smart Bulb Synchronizer
 # ==============================================================================
 
+def get_ip_address(ifname: str) -> str:
+    """Returns IPv4 address of a network interface using ioctl."""
+    import fcntl, struct
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+            s.fileno(),
+            0x8915,  # SIOCGIFADDR
+            struct.pack('256s', ifname[:15].encode('utf-8'))
+        )[20:24])
+    except Exception:
+        return None
+
+def get_ethernet_ip() -> str:
+    """Finds the IP address of the Ethernet/USB tether interface (excluding hotspot wlp2s0)."""
+    try:
+        for iface in os.listdir('/sys/class/net'):
+            if iface.startswith(('en', 'eth')):
+                ip = get_ip_address(iface)
+                if ip:
+                    return ip
+    except Exception:
+        pass
+    return None
+
+if HAS_TINYTUYA:
+    class BoundBulbDevice(tinytuya.BulbDevice):
+        """BulbDevice subclass that binds sockets exclusively to an explicit interface IP (e.g. Ethernet)."""
+        def __init__(self, *args, bind_ip=None, **kwargs):
+            self.bind_ip = bind_ip
+            super().__init__(*args, **kwargs)
+
+        def _get_socket(self, renew):
+            if renew and self.socket is not None:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+            if self.socket is None:
+                if not self.address:
+                    return tinytuya.ERR_OFFLINE
+                family = socket.AF_INET6 if ':' in self.address else socket.AF_INET
+                sock = socket.socket(family, socket.SOCK_STREAM)
+                if self.socketNODELAY:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(self.connection_timeout)
+                if self.bind_ip:
+                    try:
+                        sock.bind((self.bind_ip, 0))
+                    except Exception as e:
+                        print(f"[!] Warning: Failed to bind bulb socket to {self.bind_ip}: {e}")
+                try:
+                    sock.connect((self.address, self.port))
+                    self.socket = sock
+                    if self.version >= 3.4:
+                        if self._negotiate_session_key():
+                            return True
+                        else:
+                            if self.socket:
+                                self.socket.close()
+                                self.socket = None
+                            return tinytuya.ERR_KEY_OR_VER
+                    return True
+                except Exception:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    self.socket = None
+                    return tinytuya.ERR_CONNECT
+            return True
+else:
+    class BoundBulbDevice:
+        pass
+
 class TuyaLocalDevice:
     """
-    Controls Tuya bulb directly over local Wi-Fi router using tinytuya.BulbDevice
+    Controls Tuya bulb directly over local Wi-Fi router using BoundBulbDevice
     with a persistent TCP socket (~10-15 Hz, sub-10ms latency).
+    Can bind exclusively to Ethernet so the Wi-Fi hotspot is 100% reserved for InputLeap.
     """
-    def __init__(self, device_id: str, local_ip: str, local_key: str, version: float = 3.5):
+    def __init__(self, device_id: str, local_ip: str, local_key: str, version: float = 3.5, bind_ip: str = None):
         self.device_id = device_id.strip()
         self.local_ip = local_ip.strip()
         self.local_key = local_key.strip()
         self.version = float(version)
+        self.bind_ip = bind_ip
         self.bulb = None
         self.is_connected = False
         self.lock = threading.Lock()
         self.last_attempt_time = 0
+
+    def set_bind_ip(self, bind_ip: str):
+        with self.lock:
+            if self.bind_ip != bind_ip:
+                self.bind_ip = bind_ip
+                if self.bulb:
+                    try:
+                        self.bulb.close()
+                    except Exception:
+                        pass
+                    self.bulb = None
+                self.is_connected = False
 
     def connect(self) -> bool:
         if not HAS_TINYTUYA or not self.local_ip or not self.local_key:
@@ -234,18 +324,20 @@ class TuyaLocalDevice:
             self.last_attempt_time = now
 
             try:
-                # Persistent socket direct connection to local bulb on port 6668
-                self.bulb = tinytuya.BulbDevice(
+                # Persistent socket direct connection bound strictly to Ethernet if available
+                self.bulb = BoundBulbDevice(
                     dev_id=self.device_id,
                     address=self.local_ip,
                     local_key=self.local_key,
                     version=self.version,
-                    persist=True
+                    persist=True,
+                    bind_ip=self.bind_ip
                 )
                 self.bulb.set_version(self.version)
                 self.bulb.set_socketPersistent(True)
                 # Ensure bulb is powered on in colour mode
                 self.bulb.set_multiple_values({'20': True, '21': 'colour'}, nowait=True)
+                self._drain_socket()
                 self.is_connected = True
                 return True
             except Exception:
@@ -549,6 +641,9 @@ class TuyaBulbSync:
         self.white_temp = int(self.config.get("white_temp", 500))
         self.last_sent_white = -1
 
+        self.use_ethernet_only = bool(self.config.get("use_ethernet_only", True))
+        self.ethernet_ip = get_ethernet_ip()
+
         # Target color from screen frame in RGB space [0.0 .. 1.0]
         self.target_r = 1.0
         self.target_g = 1.0
@@ -578,13 +673,15 @@ class TuyaBulbSync:
             if HAS_TINYTUYA and not self.local_key and self.config.get("access_id") and self.config.get("access_secret"):
                 self._fetch_local_key_from_cloud()
 
-            # Initialize local device
+            # Initialize local device bound strictly to Ethernet if enabled
             if HAS_TINYTUYA and self.local_ip and self.local_key:
+                bind_ip = self.ethernet_ip if self.use_ethernet_only else None
                 self.local_device = TuyaLocalDevice(
                     device_id=self.device_id,
                     local_ip=self.local_ip,
                     local_key=self.local_key,
-                    version=self.protocol_version
+                    version=self.protocol_version,
+                    bind_ip=bind_ip
                 )
 
             # Initialize cloud client as fallback
@@ -631,11 +728,12 @@ class TuyaBulbSync:
             "max_brightness": 100,
             "dynamic_brightness": True,
             "phone_flash_enabled": True,
+            "use_ethernet_only": True,
             "white_mode": False,
             "white_temp": 500,
             "saturation_boost": 1.8,
             "smoothing_alpha": 0.50,
-            "local_refresh_hz": 20,
+            "local_refresh_hz": 10.0,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -676,6 +774,17 @@ class TuyaBulbSync:
             self.phone_flash_enabled = bool(enable)
             self.config["phone_flash_enabled"] = self.phone_flash_enabled
         self.save_config()
+
+    def set_ethernet_only(self, enable: bool):
+        with self.lock:
+            self.use_ethernet_only = bool(enable)
+            self.config["use_ethernet_only"] = self.use_ethernet_only
+            self.ethernet_ip = get_ethernet_ip()
+            bind_ip = self.ethernet_ip if self.use_ethernet_only else None
+        self.save_config()
+        if self.local_device:
+            self.local_device.set_bind_ip(bind_ip)
+            self.local_device.connect()
 
     def set_white_mode(self, enable: bool):
         with self.lock:
@@ -911,6 +1020,7 @@ class TuyaBulbSync:
                         dyn = sync_self.dynamic_brightness
                         flash = sync_self.phone_flash_enabled
                         white = sync_self.white_mode
+                        eth = sync_self.use_ethernet_only
                         mode_str = sync_self.mode
                         if white:
                             r_d, g_d, b_d = 255, 255, 255
@@ -924,6 +1034,7 @@ class TuyaBulbSync:
                     dyn_checked = "checked" if dyn else ""
                     flash_checked = "checked" if flash else ""
                     white_checked = "checked" if white else ""
+                    eth_checked = "checked" if eth else ""
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1012,6 +1123,10 @@ class TuyaBulbSync:
         <div class="val" id="val">{b}%</div>
         <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
         <div class="toggle-box">
+            <span>Ethernet Only (Isolate Hotspot)</span>
+            <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
+        </div>
+        <div class="toggle-box">
             <span>Normal White Mode</span>
             <input type="checkbox" id="white-toggle" {white_checked} onchange="toggleWhite(this.checked)">
         </div>
@@ -1030,6 +1145,9 @@ class TuyaBulbSync:
             document.getElementById('val').innerText = v + '%';
             fetch('/brightness?val=' + v);
         }}
+        function toggleEth(checked) {{
+            fetch('/ethernet_toggle?val=' + (checked ? '1' : '0'));
+        }}
         function toggleWhite(checked) {{
             fetch('/white_mode?val=' + (checked ? '1' : '0'));
         }}
@@ -1039,14 +1157,16 @@ class TuyaBulbSync:
         function toggleFlash(checked) {{
             fetch('/phone_flash?val=' + (checked ? '1' : '0'));
         }}
-        setInterval(async () => {{
+        async function fetchStatus() {{
+            if (document.hidden) return;
             try {{
                 let r = await fetch('/status');
                 let d = await r.json();
                 document.getElementById('swatch').style.background = 'rgb(' + d.r + ',' + d.g + ',' + d.b + ')';
                 document.getElementById('mode-badge').innerText = d.mode;
             }} catch(e) {{}}
-        }}, 400);
+        }}
+        setInterval(fetchStatus, 2000);
     </script>
 </body>
 </html>"""
@@ -1062,6 +1182,15 @@ class TuyaBulbSync:
                             sync_self.set_brightness(int(qs["val"][0]))
                         except Exception:
                             pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/ethernet_toggle":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_ethernet_only(qs["val"][0] == "1")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -1100,6 +1229,8 @@ class TuyaBulbSync:
                         dyn = sync_self.dynamic_brightness
                         flash = sync_self.phone_flash_enabled
                         white = sync_self.white_mode
+                        eth = sync_self.use_ethernet_only
+                        eth_ip = sync_self.ethernet_ip
                         mode_str = sync_self.mode
                         if white:
                             r_d, g_d, b_d = 255, 255, 255
@@ -1118,6 +1249,8 @@ class TuyaBulbSync:
                         "dynamic": dyn,
                         "phone_flash": flash,
                         "white_mode": white,
+                        "ethernet_only": eth,
+                        "ethernet_ip": eth_ip,
                         "mode": display_mode,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
