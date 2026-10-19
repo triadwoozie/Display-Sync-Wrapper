@@ -253,6 +253,23 @@ class TuyaLocalDevice:
                 self.bulb = None
                 return False
 
+    def _drain_socket(self):
+        """Drains incoming response packets non-blocking so the TCP buffer never accumulates."""
+        if self.bulb and getattr(self.bulb, 'socket', None):
+            try:
+                self.bulb.socket.setblocking(False)
+                while True:
+                    data = self.bulb.socket.recv(4096)
+                    if not data:
+                        break
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.bulb.socket.setblocking(True)
+                except Exception:
+                    pass
+
     def send_hsv(self, h: int, s: int, v: int) -> bool:
         """Sends HSV color directly over local Wi-Fi TCP socket (non-blocking nowait=True)."""
         if not self.is_connected or not self.bulb:
@@ -263,6 +280,7 @@ class TuyaLocalDevice:
         with self.lock:
             try:
                 self.bulb.set_value('24', hex_val, nowait=True)
+                self._drain_socket()
                 return True
             except Exception:
                 self.is_connected = False
@@ -288,6 +306,7 @@ class TuyaLocalDevice:
                     '22': int(brightness),
                     '23': int(temp)
                 }, nowait=True)
+                self._drain_socket()
                 return True
             except Exception:
                 self.is_connected = False
@@ -521,9 +540,8 @@ class TuyaBulbSync:
         self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
-        self.saturation_boost = float(self.config.get("saturation_boost", 1.8))
-        self.alpha = float(self.config.get("smoothing_alpha", 0.20))
-        self.local_hz = float(self.config.get("local_refresh_hz", 25.0))
+        self.alpha = float(self.config.get("smoothing_alpha", 0.25))
+        self.local_hz = float(self.config.get("local_refresh_hz", 10.0))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -535,17 +553,17 @@ class TuyaBulbSync:
         self.target_r = 1.0
         self.target_g = 1.0
         self.target_b = 1.0
-        self.target_lum = 0.5
-        self.target_peak = 0.5
+        self.target_lum = 0.1
+        self.target_peak = 0.1
         self.target_bloom = 0.0
 
         # Current smoothed color state in RGB space
         self.curr_r = 1.0
         self.curr_g = 1.0
         self.curr_b = 1.0
-        self.curr_v = float(self.brightness * 10)
+        self.curr_v = float(self.min_brightness * 10)
         self.last_sent_hsv = (-1, -1, -1)
-        self.current_display_b = self.brightness
+        self.current_display_b = self.min_brightness
 
         self.lock = threading.Lock()
         self.running = False
@@ -703,21 +721,22 @@ class TuyaBulbSync:
             sat[mask_nz] = delta[mask_nz] / cmax[mask_nz]
 
             # 1. Overall ambient luminance
-            mean_lum = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
+            lum_map = 0.299 * r + 0.587 * g + 0.114 * b
+            mean_lum = float(np.mean(lum_map))
 
-            # 2. Peak luminance in scene
-            peak_lum = float(np.max(0.299 * r + 0.587 * g + 0.114 * b))
+            # 2. 90th percentile luminance (regional brightness, ignores stray 1-pixel mouse cursor)
+            p90_lum = float(np.percentile(lum_map, 90))
 
-            # 3. Bloom / vibrant saturated highlight intensity (so neon/lasers/sparks shine bright)
-            bloom_score = float(np.max(sat * cmax))
+            # 3. 90th percentile bloom / vibrant saturated highlights (so lasers/neon shine, but not tiny noise)
+            bloom_p90 = float(np.percentile(sat * cmax, 90))
 
             with self.lock:
                 self.target_r = avg_r
                 self.target_g = avg_g
                 self.target_b = avg_b
                 self.target_lum = mean_lum
-                self.target_peak = peak_lum
-                self.target_bloom = bloom_score
+                self.target_peak = p90_lum
+                self.target_bloom = bloom_p90
         except Exception:
             pass
 
@@ -775,11 +794,10 @@ class TuyaBulbSync:
             self.curr_b += alpha * (tb - self.curr_b)
 
             # 2. Dynamic brightness target:
-            # Combines ambient screen luminance, peak highlights, and bloom score
-            # Saturated highlights and bloom keep brightness up during games/dark scenes
+            # Dark scenes drop cleanly to min 10% clamp; bloom highlights provide natural illumination
             if dyn:
-                eff_light = max(tlum, 0.40 * tpeak, 0.50 * tbloom)
-                lum_factor = max(0.0, min(1.0, eff_light)) ** 0.85
+                eff_light = max(tlum, 0.25 * tpeak, 0.40 * tbloom)
+                lum_factor = max(0.0, min(1.0, eff_light)) ** 1.3
                 eff_brightness = min_b + (bright_pct - min_b) * lum_factor
                 target_v = max(float(min_b), min(float(max_b), eff_brightness))
             else:
@@ -808,21 +826,22 @@ class TuyaBulbSync:
                 h_tuya = int((h * 60.0) % 360.0)
 
                 s_raw = delta / cmax
-                # If saturation is very low (< 6%), display clean pure white (no sickly off-white tint)
-                if s_raw < 0.06:
+                # If saturation is very low (< 8%), display clean pure white (no sickly off-white tint)
+                if s_raw < 0.08:
                     s_tuya = 0
                     h_tuya = 0
                 else:
-                    # Natural saturation matching the screen
-                    s_tuya = int(min(1000, s_raw * 1000))
+                    # Scale from pleasant 250 up to 1000 without hitting muddy bottom zone
+                    progress = min(1.0, (s_raw - 0.08) / 0.92)
+                    s_tuya = int(250 + progress * 750)
 
             v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
             self.current_display_b = int(v_tuya / 10)
 
             # 4. Deadband check: send if changed
             last_h, last_s, last_v = self.last_sent_hsv
-            threshold = 1 if is_local else 5
-            if abs(h_tuya - last_h) >= threshold or abs(s_tuya - last_s) >= (threshold * 3) or abs(v_tuya - last_v) >= (threshold * 3):
+            threshold = 2 if is_local else 5
+            if abs(h_tuya - last_h) >= threshold or abs(s_tuya - last_s) >= 8 or abs(v_tuya - last_v) >= 6:
                 sent = False
                 if self.local_device:
                     sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
