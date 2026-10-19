@@ -442,7 +442,7 @@ class TuyaBulbSync:
             self.config["dynamic_brightness"] = cli_dynamic
             changed = True
         if cli_brightness is not None:
-            self.config["brightness"] = max(30, min(100, int(cli_brightness)))
+            self.config["brightness"] = max(10, min(100, int(cli_brightness)))
             changed = True
 
         if changed:
@@ -454,14 +454,14 @@ class TuyaBulbSync:
         self.protocol_version = float(self.config.get("protocol_version", 3.5))
 
         self.enabled = bool(self.config.get("enabled", True) and self.device_id)
-        self.brightness = max(30, min(100, int(self.config.get("brightness", 70))))
-        self.min_brightness = max(30, int(self.config.get("min_brightness", 30)))
+        self.brightness = max(10, min(100, int(self.config.get("brightness", 70))))
+        self.min_brightness = max(10, int(self.config.get("min_brightness", 10)))
         self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
         self.saturation_boost = float(self.config.get("saturation_boost", 1.8))
-        self.alpha = float(self.config.get("smoothing_alpha", 0.20))
-        self.local_hz = float(self.config.get("local_refresh_hz", 12.0))
+        self.alpha = float(self.config.get("smoothing_alpha", 0.50))
+        self.local_hz = float(self.config.get("local_refresh_hz", 20.0))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -538,13 +538,13 @@ class TuyaBulbSync:
             "access_secret": "",
             "region": "in",
             "brightness": 70,
-            "min_brightness": 30,
+            "min_brightness": 10,
             "max_brightness": 100,
             "dynamic_brightness": True,
             "phone_flash_enabled": True,
             "saturation_boost": 1.8,
-            "smoothing_alpha": 0.20,
-            "local_refresh_hz": 12,
+            "smoothing_alpha": 0.50,
+            "local_refresh_hz": 20,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -704,7 +704,7 @@ class TuyaBulbSync:
             target_v_tuya = target_v * 10.0
             self.curr_v += alpha * (target_v_tuya - self.curr_v)
 
-            # 3. Format Tuya HSV (V clamped to min 30% = 300)
+            # 3. Format Tuya HSV (V clamped to min 10% = 100)
             h_tuya = int(self.curr_h) % 360
             s_tuya = int(max(0, min(1000, self.curr_s)))
             v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
@@ -712,7 +712,7 @@ class TuyaBulbSync:
 
             # 4. Deadband check: send if changed
             last_h, last_s, last_v = self.last_sent_hsv
-            threshold = 2 if is_local else 6
+            threshold = 1 if is_local else 5
             if abs(h_tuya - last_h) >= threshold or abs(s_tuya - last_s) >= (threshold * 3) or abs(v_tuya - last_v) >= (threshold * 3):
                 sent = False
                 if self.local_device:
@@ -873,7 +873,7 @@ class TuyaBulbSync:
         <div class="swatch" id="swatch"></div>
         <div class="sub">Bulb Brightness</div>
         <div class="val" id="val">{b}%</div>
-        <input type="range" min="30" max="100" value="{b}" id="slider" oninput="update(this.value)">
+        <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
         <div class="toggle-box">
             <span>Dynamic Bulb Shifts</span>
             <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
@@ -882,7 +882,7 @@ class TuyaBulbSync:
             <span>Phone Torch on Rumble</span>
             <input type="checkbox" id="flash-toggle" {flash_checked} onchange="toggleFlash(this.checked)">
         </div>
-        <div class="sub">Min 30% clamp prevents cutoff & flicker</div>
+        <div class="sub">Min 10% clamp prevents cutoff & flicker</div>
     </div>
     <script>
         function update(v) {{
