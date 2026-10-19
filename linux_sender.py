@@ -47,7 +47,7 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 5555
-FPS_TARGET = 60
+FPS_TARGET = 30
 
 WIDTH = 16
 HEIGHT = 9
@@ -618,7 +618,7 @@ class TuyaBulbSync:
             self.config["brightness"] = max(10, min(100, int(cli_brightness)))
             changed = True
         if cli_hz is not None:
-            self.config["local_refresh_hz"] = float(cli_hz)
+            self.config["local_refresh_hz"] = max(2.0, min(14.0, float(cli_hz)))
             changed = True
 
         if changed:
@@ -636,7 +636,8 @@ class TuyaBulbSync:
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
         self.alpha = float(self.config.get("smoothing_alpha", 0.25))
-        self.local_hz = float(self.config.get("local_refresh_hz", 30.0))
+        raw_hz = float(self.config.get("local_refresh_hz", 14.0))
+        self.local_hz = max(2.0, min(14.0, raw_hz))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -654,6 +655,7 @@ class TuyaBulbSync:
         self.target_lum = 0.1
         self.target_peak = 0.1
         self.target_bloom = 0.0
+        self.target_black = 0.0
 
         # Current smoothed color state in RGB space
         self.curr_r = 1.0
@@ -736,7 +738,7 @@ class TuyaBulbSync:
             "white_temp": 500,
             "saturation_boost": 1.8,
             "smoothing_alpha": 0.50,
-            "local_refresh_hz": 30.0,
+            "local_refresh_hz": 14.0,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -842,6 +844,9 @@ class TuyaBulbSync:
             # 3. 90th percentile bloom / vibrant saturated highlights (so lasers/neon shine, but not tiny noise)
             bloom_p90 = float(np.percentile(sat * cmax, 90))
 
+            # 4. Measure percentage of screen that is near-black (for dark scene detection)
+            black_frac = float(np.mean(lum_map < 0.12))
+
             with self.lock:
                 self.target_r = avg_r
                 self.target_g = avg_g
@@ -849,6 +854,7 @@ class TuyaBulbSync:
                 self.target_lum = mean_lum
                 self.target_peak = p90_lum
                 self.target_bloom = bloom_p90
+                self.target_black = black_frac
         except Exception:
             pass
 
@@ -880,6 +886,7 @@ class TuyaBulbSync:
                 tlum = self.target_lum
                 tpeak = self.target_peak
                 tbloom = self.target_bloom
+                tblack = self.target_black
                 w_temp = self.white_temp
 
             # If Bulb is in Normal White Mode:
@@ -906,12 +913,30 @@ class TuyaBulbSync:
             self.curr_b += alpha * (tb - self.curr_b)
 
             # 2. Dynamic brightness target:
-            # Dark scenes drop cleanly to min 10% clamp; bloom highlights provide natural illumination
+            # - On pure white: pushes all the way to 100% brightness
+            # - Generally keeps brightness decently high unless the scene has a lot of blacks in it
+            # - When the scene has a lot of blacks, drops cleanly to the 10% minimum clamp
             if dyn:
-                eff_light = max(tlum, 0.25 * tpeak, 0.40 * tbloom)
-                lum_factor = max(0.0, min(1.0, eff_light)) ** 1.3
-                eff_brightness = min_b + (bright_pct - min_b) * lum_factor
-                target_v = max(float(min_b), min(float(max_b), eff_brightness))
+                eff_light = max(tlum, 0.35 * tpeak, 0.45 * tbloom)
+                # Strong dark factor only when screen has a significant portion of black pixels
+                dark_factor = max(0.0, min(1.0, (tblack - 0.20) / 0.60)) if tlum < 0.35 else 0.0
+
+                # Base scene factor (high by default for normal scenes, suppressed when lots of black)
+                scene_factor = max(0.0, min(1.0, (eff_light / 0.35) ** 0.75))
+                if dark_factor > 0:
+                    scene_factor *= (1.0 - dark_factor * 0.90)
+
+                base_v = min_b + (bright_pct - min_b) * scene_factor
+
+                # Pure white detector: pushes brightness up to 100% on pure whites
+                min_rgb = min(tr, tg, tb)
+                if min_rgb > 0.65 and tlum > 0.65:
+                    white_progress = min(1.0, (min_rgb - 0.65) / 0.30)
+                    target_v = base_v + (100.0 - base_v) * white_progress
+                else:
+                    target_v = base_v
+
+                target_v = max(float(min_b), min(100.0, target_v))
             else:
                 target_v = float(bright_pct)
 
