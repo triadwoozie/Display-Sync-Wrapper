@@ -217,6 +217,7 @@ class TuyaCloudClient:
         self.token_expire_time = 0
         self.token_lock = threading.Lock()
         self.use_legacy_code = False
+        self.initialized = False
 
     def _calc_sign(self, string_to_sign: str) -> str:
         return hmac.new(
@@ -260,31 +261,31 @@ class TuyaCloudClient:
         """Sends HSV color to bulb. h: [0..360], s: [0..1000], v: [300..1000]."""
         try:
             token = self.get_token()
-        except Exception as e:
+        except Exception:
             return False
 
         now = time.time()
         t = str(int(now * 1000))
 
+        commands = []
+        if not self.initialized:
+            commands.append({"code": "switch_led", "value": True})
+            commands.append({"code": "work_mode", "value": "colour"})
+            self.initialized = True
+
         if not self.use_legacy_code:
-            payload = {
-                "commands": [
-                    {
-                        "code": "colour_data_v2",
-                        "value": {"h": int(h), "s": int(s), "v": int(v)}
-                    }
-                ]
-            }
+            commands.append({
+                "code": "colour_data_v2",
+                "value": {"h": int(h), "s": int(s), "v": int(v)}
+            })
         else:
             hex_val = f"{int(h):04x}{int(s):04x}{int(v):04x}"
-            payload = {
-                "commands": [
-                    {
-                        "code": "colour_data",
-                        "value": hex_val
-                    }
-                ]
-            }
+            commands.append({
+                "code": "colour_data",
+                "value": hex_val
+            })
+
+        payload = {"commands": commands}
 
         body_str = json.dumps(payload, separators=(',', ':'))
         body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
