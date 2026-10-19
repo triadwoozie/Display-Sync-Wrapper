@@ -47,7 +47,7 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 5555
-FPS_TARGET = 30
+FPS_TARGET = 60
 
 WIDTH = 16
 HEIGHT = 9
@@ -588,7 +588,7 @@ class TuyaBulbSync:
     def __init__(self, config_path: str = CONFIG_FILE, cli_brightness: int = None,
                  cli_id: str = None, cli_secret: str = None, cli_device: str = None,
                  cli_region: str = None, cli_ip: str = None, cli_key: str = None,
-                 cli_dynamic: bool = None):
+                 cli_dynamic: bool = None, cli_hz: float = None):
         self.config_path = config_path
         self.config = self.load_config()
 
@@ -617,6 +617,9 @@ class TuyaBulbSync:
         if cli_brightness is not None:
             self.config["brightness"] = max(10, min(100, int(cli_brightness)))
             changed = True
+        if cli_hz is not None:
+            self.config["local_refresh_hz"] = float(cli_hz)
+            changed = True
 
         if changed:
             self.save_config()
@@ -633,7 +636,7 @@ class TuyaBulbSync:
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
         self.alpha = float(self.config.get("smoothing_alpha", 0.25))
-        self.local_hz = float(self.config.get("local_refresh_hz", 10.0))
+        self.local_hz = float(self.config.get("local_refresh_hz", 30.0))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -733,7 +736,7 @@ class TuyaBulbSync:
             "white_temp": 500,
             "saturation_boost": 1.8,
             "smoothing_alpha": 0.50,
-            "local_refresh_hz": 10.0,
+            "local_refresh_hz": 30.0,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -1166,7 +1169,7 @@ class TuyaBulbSync:
                 document.getElementById('mode-badge').innerText = d.mode;
             }} catch(e) {{}}
         }}
-        setInterval(fetchStatus, 2000);
+        setInterval(fetchStatus, 5000);
     </script>
 </body>
 </html>"""
@@ -1276,7 +1279,7 @@ class TuyaBulbSync:
 class MutterScreenSync:
     def __init__(self, port=PORT, fps=FPS_TARGET, auto_dismiss_ui=True, skip_phone=False,
                  tuya_brightness=None, tuya_id=None, tuya_secret=None, tuya_device=None,
-                 tuya_region=None, tuya_ip=None, tuya_key=None, tuya_dynamic=None):
+                 tuya_region=None, tuya_ip=None, tuya_key=None, tuya_dynamic=None, tuya_hz=None):
         self.port = port
         self.fps = fps
         self.auto_dismiss_ui = auto_dismiss_ui
@@ -1304,7 +1307,8 @@ class MutterScreenSync:
                 cli_region=tuya_region,
                 cli_ip=tuya_ip,
                 cli_key=tuya_key,
-                cli_dynamic=tuya_dynamic
+                cli_dynamic=tuya_dynamic,
+                cli_hz=tuya_hz
             )
             if self.tuya.enabled:
                 self.tuya.start()
@@ -1514,6 +1518,7 @@ def main():
     parser.add_argument("--tuya-key", type=str, default=None, help="Tuya bulb local 16-character encryption key")
     parser.add_argument("--tuya-dynamic", action="store_true", default=None, help="Enable dynamic brightness shifts")
     parser.add_argument("--no-tuya-dynamic", dest="tuya_dynamic", action="store_false", help="Disable dynamic brightness shifts")
+    parser.add_argument("--tuya-hz", type=float, default=None, help="Tuya bulb local refresh rate in Hz (default 30)")
     args = parser.parse_args()
 
     # 1. Unlock phone and launch app if not skipped
@@ -1532,7 +1537,8 @@ def main():
         tuya_region=args.tuya_region,
         tuya_ip=args.tuya_ip,
         tuya_key=args.tuya_key,
-        tuya_dynamic=args.tuya_dynamic
+        tuya_dynamic=args.tuya_dynamic,
+        tuya_hz=args.tuya_hz
     )
 
     # 2. Signal handlers for clean exit on Ctrl-C or SIGTERM
