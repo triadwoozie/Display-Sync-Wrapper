@@ -47,7 +47,7 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 5555
-FPS_TARGET = 60
+FPS_TARGET = 30
 
 WIDTH = 16
 HEIGHT = 9
@@ -255,12 +255,11 @@ if HAS_TINYTUYA:
                 sock = socket.socket(family, socket.SOCK_STREAM)
                 if self.socketNODELAY:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.settimeout(self.connection_timeout)
+                sock.settimeout(0.4)
                 if self.bind_ip:
                     try:
                         sock.bind((self.bind_ip, 0))
                     except Exception:
-                        # Fallback: if bind fails (e.g. interface unplugged), continue unbound
                         pass
                 try:
                     sock.connect((self.address, self.port))
@@ -288,9 +287,10 @@ else:
 
 class TuyaLocalDevice:
     """
-    Controls Tuya bulb directly over local Wi-Fi router using BoundBulbDevice
-    with a persistent TCP socket (~10-15 Hz, sub-10ms latency).
+    Controls Tuya bulb directly over local network using BoundBulbDevice
+    with a persistent TCP socket (~10-20 Hz, sub-10ms latency).
     Can bind exclusively to Ethernet so the Wi-Fi hotspot is 100% reserved for InputLeap.
+    Recovers cleanly upon disconnect or USB phone unplug/replug.
     """
     def __init__(self, device_id: str, local_ip: str, local_key: str, version: float = 3.5, bind_ip: str = None):
         self.device_id = device_id.strip()
@@ -307,13 +307,20 @@ class TuyaLocalDevice:
         with self.lock:
             if self.bind_ip != bind_ip:
                 self.bind_ip = bind_ip
-                if self.bulb:
-                    try:
-                        self.bulb.close()
-                    except Exception:
-                        pass
-                    self.bulb = None
-                self.is_connected = False
+                self._close_socket()
+
+    def _close_socket(self):
+        self.is_connected = False
+        if self.bulb:
+            try:
+                self.bulb.close()
+            except Exception:
+                pass
+            self.bulb = None
+
+    def disconnect(self):
+        with self.lock:
+            self._close_socket()
 
     def connect(self) -> bool:
         if not HAS_TINYTUYA or not self.local_ip or not self.local_key:
@@ -332,9 +339,10 @@ class TuyaLocalDevice:
                 elif active_eth != self.bind_ip:
                     self.bind_ip = active_eth
 
+            self._close_socket()
+
             try:
-                # Persistent socket direct connection bound strictly to Ethernet if available
-                self.bulb = BoundBulbDevice(
+                bulb = BoundBulbDevice(
                     dev_id=self.device_id,
                     address=self.local_ip,
                     local_key=self.local_key,
@@ -342,16 +350,36 @@ class TuyaLocalDevice:
                     persist=True,
                     bind_ip=self.bind_ip
                 )
-                self.bulb.set_version(self.version)
-                self.bulb.set_socketPersistent(True)
+                bulb.set_version(self.version)
+                bulb.set_socketPersistent(True)
+                bulb.set_socketTimeout(0.4)
+                bulb.socketRetryLimit = 1
+                bulb.socketRetryDelay = 0.05
+
+                # Verify connection & session key negotiation
+                sock_ok = bulb._get_socket(True)
+                if sock_ok is not True or not getattr(bulb, 'socket', None):
+                    try:
+                        bulb.close()
+                    except Exception:
+                        pass
+                    return False
+
                 # Ensure bulb is powered on in colour mode
-                self.bulb.set_multiple_values({'20': True, '21': 'colour'}, nowait=True)
-                self._drain_socket()
+                res = bulb.set_multiple_values({'20': True, '21': 'colour'}, nowait=True)
+                if isinstance(res, dict) and ('Error' in res or 'Err' in res):
+                    try:
+                        bulb.close()
+                    except Exception:
+                        pass
+                    return False
+
+                self.bulb = bulb
                 self.is_connected = True
+                self._drain_socket()
                 return True
             except Exception:
-                self.is_connected = False
-                self.bulb = None
+                self._close_socket()
                 return False
 
     def _drain_socket(self):
@@ -367,85 +395,78 @@ class TuyaLocalDevice:
                 pass
             finally:
                 try:
-                    self.bulb.socket.setblocking(True)
+                    if self.bulb and getattr(self.bulb, 'socket', None):
+                        self.bulb.socket.setblocking(True)
                 except Exception:
                     pass
 
     def send_hsv(self, h: int, s: int, v: int) -> bool:
         """Sends HSV color directly over local Wi-Fi TCP socket (non-blocking nowait=True)."""
-        if not self.is_connected or not self.bulb:
+        if not self.is_connected or not self.bulb or not getattr(self.bulb, 'socket', None):
             if not self.connect():
                 return False
 
         hex_val = f"{int(h):04x}{int(s):04x}{int(v):04x}"
         with self.lock:
             try:
-                self.bulb.set_value('24', hex_val, nowait=True)
+                res = self.bulb.set_value('24', hex_val, nowait=True)
+                if (isinstance(res, dict) and ('Error' in res or 'Err' in res)) or not getattr(self.bulb, 'socket', None):
+                    self._close_socket()
+                    return False
                 self._drain_socket()
                 return True
             except Exception:
-                self.is_connected = False
-                try:
-                    if self.bulb:
-                        self.bulb.close()
-                except Exception:
-                    pass
-                self.bulb = None
+                self._close_socket()
                 return False
 
     def send_white(self, brightness: int, temp: int = 500) -> bool:
         """Sets bulb to normal white mode with specified brightness (10-1000) and temp (0-1000)."""
-        if not self.is_connected or not self.bulb:
+        if not self.is_connected or not self.bulb or not getattr(self.bulb, 'socket', None):
             if not self.connect():
                 return False
 
         with self.lock:
             try:
-                self.bulb.set_multiple_values({
+                res = self.bulb.set_multiple_values({
                     '20': True,
                     '21': 'white',
                     '22': int(brightness),
                     '23': int(temp)
                 }, nowait=True)
+                if (isinstance(res, dict) and ('Error' in res or 'Err' in res)) or not getattr(self.bulb, 'socket', None):
+                    self._close_socket()
+                    return False
                 self._drain_socket()
                 return True
             except Exception:
-                self.is_connected = False
-                try:
-                    if self.bulb:
-                        self.bulb.close()
-                except Exception:
-                    pass
-                self.bulb = None
+                self._close_socket()
                 return False
 
     def set_power(self, power: bool) -> bool:
         """Powers the bulb on or off."""
-        if not self.is_connected or not self.bulb:
+        if not self.is_connected or not self.bulb or not getattr(self.bulb, 'socket', None):
             if power and not self.connect():
                 return False
         with self.lock:
             try:
                 if self.bulb:
                     if power:
-                        self.bulb.turn_on(nowait=True)
+                        res = self.bulb.turn_on(nowait=True)
                     else:
-                        self.bulb.turn_off(nowait=True)
+                        res = self.bulb.turn_off(nowait=True)
+                    if isinstance(res, dict) and ('Error' in res or 'Err' in res):
+                        self._close_socket()
+                        return False
                     self._drain_socket()
                     return True
                 return False
             except Exception:
+                self._close_socket()
                 return False
 
     def close(self):
         with self.lock:
-            if self.bulb:
-                try:
-                    self.bulb.close()
-                except Exception:
-                    pass
-                self.bulb = None
-            self.is_connected = False
+            self._close_socket()
 
 
 class TuyaCloudClient:
@@ -965,12 +986,16 @@ class TuyaBulbSync:
                         old_eth = self.ethernet_ip
                         self.ethernet_ip = detected_eth
                         if self.local_device:
+                            self.local_device.disconnect()
                             self.local_device.set_bind_ip(detected_eth)
                             self.local_device.connect()
                         if old_eth and not detected_eth:
                             print(f"\n[*] Phone unplugged: automatic fallback to local Wi-Fi for bulb streaming")
                         elif detected_eth and not old_eth:
                             print(f"\n[*] Phone plugged in: switched bulb streaming to USB Ethernet ({detected_eth})")
+                    elif self.local_device and not self.local_device.is_connected:
+                        # Auto-reconnect if dropped or after phone replug
+                        self.local_device.connect()
 
             with self.lock:
                 power = self.power_on
@@ -1099,6 +1124,8 @@ class TuyaBulbSync:
                 if sent:
                     self.last_sent_hsv = (h_tuya, s_tuya, v_tuya)
                     self.last_sent_white = -1
+                else:
+                    self.mode = "Disconnected"
 
     def start(self):
         if not self.enabled:
