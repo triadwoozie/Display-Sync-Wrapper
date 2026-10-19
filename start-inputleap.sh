@@ -3,11 +3,7 @@
 # InputLeap Client & Display Sync Wrapper Linux Sender (Startup Runner)
 # ==============================================================================
 
-# 1. Disable Wi-Fi power saving on hotspot to eliminate InputLeap cursor latency
-nmcli connection modify Hotspot 802-11-wireless.powersave 2 2>/dev/null || true
-iw dev wlp2s0 set power_save off 2>/dev/null || true
-
-# 2. Start InputLeap client in background if not already running
+# 1. Start InputLeap client in background if not already running
 pgrep -x input-leapc >/dev/null || input-leapc --name compooter 10.42.0.183 &
 
 set -e
