@@ -458,6 +458,7 @@ class TuyaBulbSync:
         self.min_brightness = max(30, int(self.config.get("min_brightness", 30)))
         self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
+        self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
         self.saturation_boost = float(self.config.get("saturation_boost", 1.8))
         self.alpha = float(self.config.get("smoothing_alpha", 0.20))
         self.local_hz = float(self.config.get("local_refresh_hz", 12.0))
@@ -540,6 +541,7 @@ class TuyaBulbSync:
             "min_brightness": 30,
             "max_brightness": 100,
             "dynamic_brightness": True,
+            "phone_flash_enabled": True,
             "saturation_boost": 1.8,
             "smoothing_alpha": 0.20,
             "local_refresh_hz": 12,
@@ -576,6 +578,12 @@ class TuyaBulbSync:
         with self.lock:
             self.dynamic_brightness = bool(enable)
             self.config["dynamic_brightness"] = self.dynamic_brightness
+        self.save_config()
+
+    def set_phone_flash(self, enable: bool):
+        with self.lock:
+            self.phone_flash_enabled = bool(enable)
+            self.config["phone_flash_enabled"] = self.phone_flash_enabled
         self.save_config()
 
     def update_frame(self, arr: np.ndarray):
@@ -760,6 +768,7 @@ class TuyaBulbSync:
                     with sync_self.lock:
                         b = sync_self.brightness
                         dyn = sync_self.dynamic_brightness
+                        flash = sync_self.phone_flash_enabled
                         mode_str = sync_self.mode
                         h_norm = (sync_self.curr_h % 360.0) / 360.0
                         s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
@@ -768,12 +777,13 @@ class TuyaBulbSync:
                         r_d, g_d, b_d = int(r_f * 255), int(g_f * 255), int(b_f * 255)
 
                     dyn_checked = "checked" if dyn else ""
+                    flash_checked = "checked" if flash else ""
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Tuya Bulb Ambient Sync</title>
+    <title>Display Sync Controls</title>
     <style>
         body {{
             background: #111116;
@@ -787,14 +797,14 @@ class TuyaBulbSync:
         }}
         .card {{
             background: #1b1b24;
-            padding: 30px;
+            padding: 28px 24px;
             border-radius: 20px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.6);
             width: 330px;
             text-align: center;
             border: 1px solid rgba(255,255,255,0.08);
         }}
-        h2 {{ margin: 0 0 10px; font-size: 20px; }}
+        h2 {{ margin: 0 0 8px; font-size: 20px; }}
         .badge {{
             display: inline-block;
             background: rgba(76, 175, 80, 0.2);
@@ -803,27 +813,27 @@ class TuyaBulbSync:
             border-radius: 12px;
             font-size: 11px;
             font-weight: bold;
-            margin-bottom: 15px;
+            margin-bottom: 12px;
         }}
         .swatch {{
-            width: 70px;
-            height: 70px;
+            width: 64px;
+            height: 64px;
             border-radius: 50%;
-            margin: 10px auto 15px;
+            margin: 6px auto 12px;
             border: 3px solid rgba(255,255,255,0.2);
             transition: background 0.15s ease;
             background: rgb({r_d},{g_d},{b_d});
         }}
         .val {{
-            font-size: 32px;
+            font-size: 30px;
             font-weight: bold;
             color: #ffb300;
-            margin: 10px 0;
+            margin: 8px 0;
             font-family: monospace;
         }}
         input[type=range] {{
             width: 100%;
-            margin: 15px 0 10px;
+            margin: 12px 0 8px;
             accent-color: #ffb300;
             height: 8px;
             border-radius: 4px;
@@ -834,31 +844,36 @@ class TuyaBulbSync:
             justify-content: space-between;
             align-items: center;
             background: rgba(255,255,255,0.05);
-            padding: 10px 14px;
+            padding: 9px 14px;
             border-radius: 12px;
-            margin: 15px 0;
+            margin: 8px 0;
             font-size: 13px;
         }}
         .sub {{
             color: rgba(255,255,255,0.45);
-            font-size: 12px;
+            font-size: 11px;
             line-height: 1.4;
+            margin-top: 6px;
         }}
     </style>
 </head>
 <body>
     <div class="card">
-        <h2>💡 Tuya Bulb Sync</h2>
+        <h2>💡 Ambient Sync Control</h2>
         <div class="badge" id="mode-badge">{mode_str}</div>
         <div class="swatch" id="swatch"></div>
-        <div class="sub">Brightness Control</div>
+        <div class="sub">Bulb Brightness</div>
         <div class="val" id="val">{b}%</div>
         <input type="range" min="30" max="100" value="{b}" id="slider" oninput="update(this.value)">
         <div class="toggle-box">
-            <span>Dynamic Brightness</span>
+            <span>Dynamic Bulb Shifts</span>
             <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
         </div>
-        <div class="sub">Clamped: Minimum 30% prevents bulb cutoff</div>
+        <div class="toggle-box">
+            <span>Phone Torch on Rumble</span>
+            <input type="checkbox" id="flash-toggle" {flash_checked} onchange="toggleFlash(this.checked)">
+        </div>
+        <div class="sub">Min 30% clamp prevents cutoff & flicker</div>
     </div>
     <script>
         function update(v) {{
@@ -867,6 +882,9 @@ class TuyaBulbSync:
         }}
         function toggleDyn(checked) {{
             fetch('/dynamic?val=' + (checked ? '1' : '0'));
+        }}
+        function toggleFlash(checked) {{
+            fetch('/phone_flash?val=' + (checked ? '1' : '0'));
         }}
         setInterval(async () => {{
             try {{
@@ -905,10 +923,20 @@ class TuyaBulbSync:
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok"}')
 
+                elif parsed.path == "/phone_flash":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_phone_flash(qs["val"][0] == "1")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
                 elif parsed.path == "/status":
                     with sync_self.lock:
                         b = sync_self.brightness
                         dyn = sync_self.dynamic_brightness
+                        flash = sync_self.phone_flash_enabled
                         mode_str = sync_self.mode
                         h_norm = (sync_self.curr_h % 360.0) / 360.0
                         s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
@@ -922,6 +950,7 @@ class TuyaBulbSync:
                     self.wfile.write(json.dumps({
                         "brightness": b,
                         "dynamic": dyn,
+                        "phone_flash": flash,
                         "mode": mode_str,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
@@ -958,6 +987,9 @@ class MutterScreenSync:
         self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         self.sess_proxy = None
         self.last_rgb = (-1, -1, -1)
+        self.last_vibe = -1
+        self.last_raw_bytes = b""
+        self.last_print_time = 0.0
         self.phone_worker_running = True
 
         # Tuya Smart Bulb Sync
@@ -1009,6 +1041,10 @@ class MutterScreenSync:
 
         try:
             # 16x9 x 3 bytes RGB = 432 bytes total
+            raw_bytes = bytes(map_info.data)
+            is_duplicate = (raw_bytes == self.last_raw_bytes)
+            self.last_raw_bytes = raw_bytes
+
             arr = np.frombuffer(map_info.data, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
 
             # Phone Ambient Color (Strictly UNCHANGED)
@@ -1016,7 +1052,8 @@ class MutterScreenSync:
             r, g, b = int(avg_rgb[0]), int(avg_rgb[1]), int(avg_rgb[2])
 
             with vibration_lock:
-                vibe = current_vibration
+                flash_allowed = self.tuya.phone_flash_enabled if self.tuya else True
+                vibe = current_vibration if flash_allowed else 0
 
             payload = bytes([r, g, b, vibe])
 
@@ -1031,15 +1068,19 @@ class MutterScreenSync:
                         pass
                     self.sock = None
 
-            # 2. Feed frame to Tuya bulb controller (Saturation expansion + dynamic brightness + gradient easing)
-            if self.tuya and self.tuya.enabled:
+            # 2. Feed frame to Tuya bulb controller (skip if static/duplicate to keep CPU ultra-low)
+            if self.tuya and self.tuya.enabled and not is_duplicate:
                 self.tuya.update_frame(arr)
 
-            # 3. Terminal status display
-            if (r, g, b) != self.last_rgb:
+            # 3. Terminal status display (throttled to 4 Hz to avoid terminal emulator redraw load during games)
+            now = time.time()
+            if ((r, g, b) != self.last_rgb or vibe != self.last_vibe) and (now - self.last_print_time >= 0.25):
+                self.last_print_time = now
                 self.last_rgb = (r, g, b)
+                self.last_vibe = vibe
+                flash_str = "" if flash_allowed else " [Flash: Off]"
                 bulb_str = f" | Bulb ({self.tuya.mode_short()}): {self.tuya.current_brightness_display()}%" if (self.tuya and self.tuya.enabled) else ""
-                phone_str = " | Phone: Active" if self.sock else " | Phone: Connecting..."
+                phone_str = f" | Phone: Active{flash_str}" if self.sock else " | Phone: Connecting..."
                 print(f"\r[*] Screen Sync -> RGB: ({r:3d}, {g:3d}, {b:3d}) | Vibe: {vibe:3d}{phone_str}{bulb_str}   ", end="", flush=True)
 
         finally:

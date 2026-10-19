@@ -77,11 +77,17 @@ Display-Sync-Wrapper/
 - Android 8.0+ (API 26+)
 - USB Debugging enabled in Developer Options
 
-### 💡 Tuya Smart Bulb Sync
-- **Exponential Smoothing**: Glides colors softly using an exponential moving average (EMA) filter, preventing jerky or jarring bulb transitions.
-- **Rate-Limited Dispatcher**: Decoupled from the 30 FPS phone stream, sending updates to Tuya Cloud at 2 Hz (every 500ms) with deadband filtering to respect cloud latency and API quotas.
-- **Hardware Brightness Clamped**: Brightness slider range is strictly 30% to 100% to keep the bulb visible and prevent low-voltage cutoff.
-- **Interactive Web Slider**: Built-in dark-mode slider accessible at `http://localhost:5556` for instant live brightness control from your browser or phone.
+### 💡 Tuya Smart Bulb Sync & Web Controls
+- **Direct Local Wi-Fi (TinyTuya)**: Connects directly over your local Wi-Fi router to the bulb via a persistent TCP socket (`port 6668`, protocol 3.5), delivering silky smooth updates at **~12 Hz** with sub-10ms latency.
+- **Full Color Gamut Expansion**: Utilizes saturation-weighted color extraction so vibrant colors pop across the room instead of being diluted into dull white/gray.
+- **Smooth Gradient Transitions**: Employs shortest-path circular hue interpolation and exponential easing to glide between colors without abrupt color snapping.
+- **Dynamic Brightness Shifts**: Tracks perceived screen luminance to dim the bulb in dark game scenes and boost it in bright scenes (strictly clamped between 30% and 100%).
+- **Interactive Web Dashboard (`http://localhost:5556`)**:
+  - Live brightness slider (30% - 100%)
+  - Dynamic Brightness toggle switch
+  - **Phone Torch on Rumble toggle**: Instantly disable camera torch flashes when playing games where rumble is constant (e.g. racing games) while keeping screen ambient colors active.
+  - Live color swatch preview & connection mode status.
+- **Ultra-Lightweight Background Footprint**: Negligible CPU usage (~1-2%) with duplicate frame detection and throttled console prints so competitive gaming performance is never impacted.
 
 ---
 
@@ -97,15 +103,18 @@ adb shell am start -n com.flashlight.torch/.MainActivity
 ```
 
 ### 2. Configure Tuya Smart Bulb (Optional)
-Fill in your credentials in `tuya_config.json`:
+Fill in your device details in `tuya_config.json` (see `tuya_config.example.json`):
 ```json
 {
   "enabled": true,
-  "access_id": "YOUR_TUYA_ACCESS_ID",
-  "access_secret": "YOUR_TUYA_ACCESS_SECRET",
-  "device_id": "YOUR_TUYA_DEVICE_ID",
-  "region": "in",
-  "brightness": 70
+  "device_id": "YOUR_DEVICE_ID",
+  "local_key": "YOUR_LOCAL_KEY",
+  "local_ip": "192.168.1.xxx",
+  "protocol_version": 3.5,
+  "brightness": 70,
+  "min_brightness": 30,
+  "dynamic_brightness": true,
+  "phone_flash_enabled": true
 }
 ```
 
@@ -119,6 +128,13 @@ Optional flags:
 ```bash
 # Adjust Tuya bulb brightness (30-100%)
 ./run_sender.sh --tuya-brightness 80
+
+# Specify local IP / key
+./run_sender.sh --tuya-ip 192.168.1.74 --tuya-key YOUR_KEY
+
+# Enable/disable dynamic brightness
+./run_sender.sh --tuya-dynamic
+./run_sender.sh --no-tuya-dynamic
 
 # Sync only Tuya bulb (skip phone connection)
 ./run_sender.sh --no-phone
