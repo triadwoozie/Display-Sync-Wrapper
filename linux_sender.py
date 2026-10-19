@@ -620,8 +620,8 @@ class TuyaBulbSync:
 
             val = cmax
 
-            # Perceived screen luminance for dynamic brightness
-            luminance = float(np.mean(0.2126 * r + 0.7152 * g + 0.0722 * b))
+            # Perceived screen luminance for dynamic brightness (photometric weights)
+            luminance = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
 
             # Weight by sat^2 * val + 0.01 so vibrant colors dominate over neutral white/gray UI
             weights = (sat ** 2) * val + 0.01
@@ -635,19 +635,24 @@ class TuyaBulbSync:
             angles = hue * 2.0 * np.pi
             x = np.sum(weights * np.cos(angles))
             y = np.sum(weights * np.sin(angles))
-            weighted_h = float((np.arctan2(y, x) / (2.0 * np.pi)) % 1.0)
+            raw_h = float((np.arctan2(y, x) / (2.0 * np.pi)) % 1.0)
+            raw_s = float(np.sum(weights * sat))
 
-            # Weighted saturation with expansion curve
-            weighted_s = float(np.sum(weights * sat))
-            if weighted_s < 0.025:
-                # True grayscale/white screen
-                boosted_s = 0.0
+            # Aesthetic Saturation Mapping:
+            # Weak/low saturations (0.15 - 0.55) create harsh, eye-straining sickly neon pastel washes on RGB LEDs.
+            # When screen is neutral / monochrome / text, glide to a gentle, cozy warm ambient white (Hue 32°, Sat 0.12).
+            # When scene is colorful, clamp saturation into the soothing, rich, cinematic range (0.65 .. 0.95).
+            if raw_s < 0.12:
+                final_h = 32.0 / 360.0   # Soft warm 3000K incandescent white
+                final_s = 0.12            # Pleasant ambient glow (no harsh glare)
             else:
-                boosted_s = min(1.0, (weighted_s ** 0.65) * self.saturation_boost)
+                color_progress = min(1.0, (raw_s - 0.12) / 0.35)
+                final_s = 0.65 + 0.30 * color_progress
+                final_h = raw_h
 
             with self.lock:
-                self.target_h = weighted_h
-                self.target_s = boosted_s
+                self.target_h = final_h
+                self.target_s = final_s
                 self.target_lum = luminance
         except Exception:
             pass
@@ -676,9 +681,13 @@ class TuyaBulbSync:
                 min_b = self.min_brightness
                 max_b = self.max_brightness
 
-            # 1. Compute dynamic brightness target
+            # 1. Compute dynamic brightness target:
+            # Uses a perceptual gamma curve (gamma 1.8) for dramatic dark-to-white contrast:
+            # - More black on screen: luminance drops near 0 -> bulb dims all the way down to min_brightness (30%)
+            # - More white on screen: luminance approaches 1.0 -> bulb scales up to full slider brightness (up to 100%)
             if dyn:
-                eff_brightness = min_b + (bright_pct - min_b) * tlum
+                lum_factor = max(0.0, min(1.0, tlum)) ** 1.8
+                eff_brightness = min_b + (bright_pct - min_b) * lum_factor
                 target_v = max(float(min_b), min(float(max_b), eff_brightness))
             else:
                 target_v = float(bright_pct)
