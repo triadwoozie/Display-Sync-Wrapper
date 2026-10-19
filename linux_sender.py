@@ -259,8 +259,9 @@ if HAS_TINYTUYA:
                 if self.bind_ip:
                     try:
                         sock.bind((self.bind_ip, 0))
-                    except Exception as e:
-                        print(f"[!] Warning: Failed to bind bulb socket to {self.bind_ip}: {e}")
+                    except Exception:
+                        # Fallback: if bind fails (e.g. interface unplugged), continue unbound
+                        pass
                 try:
                     sock.connect((self.address, self.port))
                     self.socket = sock
@@ -319,9 +320,17 @@ class TuyaLocalDevice:
             return False
         with self.lock:
             now = time.time()
-            if now - self.last_attempt_time < 3.0:
+            if now - self.last_attempt_time < 1.0:
                 return False
             self.last_attempt_time = now
+
+            # If bind_ip is set, verify interface is still present; fallback to unbound if unplugged
+            if self.bind_ip:
+                active_eth = get_ethernet_ip()
+                if not active_eth:
+                    self.bind_ip = None
+                elif active_eth != self.bind_ip:
+                    self.bind_ip = active_eth
 
             try:
                 # Persistent socket direct connection bound strictly to Ethernet if available
@@ -699,6 +708,7 @@ class TuyaBulbSync:
 
         self.use_ethernet_only = bool(self.config.get("use_ethernet_only", True))
         self.ethernet_ip = get_ethernet_ip()
+        self.last_eth_check = 0.0
 
         # Target color from screen frame in RGB space [0.0 .. 1.0]
         self.target_r = 1.0
@@ -938,6 +948,23 @@ class TuyaBulbSync:
             if not self.enabled:
                 continue
 
+            # Automatic fallback / switch between USB Ethernet and local Wi-Fi route:
+            now = time.time()
+            if now - self.last_eth_check >= 1.0:
+                self.last_eth_check = now
+                if self.use_ethernet_only:
+                    detected_eth = get_ethernet_ip()
+                    if detected_eth != self.ethernet_ip:
+                        old_eth = self.ethernet_ip
+                        self.ethernet_ip = detected_eth
+                        if self.local_device:
+                            self.local_device.set_bind_ip(detected_eth)
+                            self.local_device.connect()
+                        if old_eth and not detected_eth:
+                            print(f"\n[*] Phone unplugged: automatic fallback to local Wi-Fi for bulb streaming")
+                        elif detected_eth and not old_eth:
+                            print(f"\n[*] Phone plugged in: switched bulb streaming to USB Ethernet ({detected_eth})")
+
             with self.lock:
                 power = self.power_on
                 w_mode = self.white_mode
@@ -966,7 +993,7 @@ class TuyaBulbSync:
                     if self.local_device:
                         sent = self.local_device.send_white(b_val, w_temp)
                         if sent:
-                            self.mode = "Local Wi-Fi"
+                            self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
                     if not sent and self.cloud_client:
                         sent = self.cloud_client.send_white(b_val)
                         if sent:
@@ -1052,7 +1079,7 @@ class TuyaBulbSync:
                 if self.local_device:
                     sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
                     if sent:
-                        self.mode = "Local Wi-Fi"
+                        self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
 
                 if not sent and self.cloud_client:
                     # Cloud fallback
@@ -1073,12 +1100,13 @@ class TuyaBulbSync:
         # Try initial local connect
         if self.local_device:
             if self.local_device.connect():
-                self.mode = "Local Wi-Fi"
-                print(f"[+] Tuya Bulb Local Sync Active: {self.local_ip}:6668 (Persistent TCP, ~{int(self.local_hz)}Hz)")
+                self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
+                bind_note = f"Bound to Ethernet: {self.local_device.bind_ip}" if self.local_device.bind_ip else "Default Local Route (Wi-Fi)"
+                print(f"[+] Tuya Bulb Local Sync Active: {self.local_ip}:6668 ({bind_note}, ~{int(self.local_hz)}Hz)")
             else:
                 print(f"[!] Local connection to {self.local_ip} pending, falling back to Cloud if needed.")
 
-        if self.mode != "Local Wi-Fi" and self.cloud_client:
+        if not self.mode.startswith("Local") and self.cloud_client:
             self.mode = "Cloud OpenAPI"
             print(f"[+] Tuya Bulb Cloud Sync Active: Device {self.device_id[:6]}... (Region: {self.config.get('region')})")
 
@@ -1096,7 +1124,12 @@ class TuyaBulbSync:
     def mode_short(self) -> str:
         if not self.power_on:
             return "Off"
-        base = "Local" if self.mode == "Local Wi-Fi" else "Cloud"
+        if self.mode in ("Local Ethernet", "Local Wi-Fi"):
+            base = self.mode
+        elif self.mode.startswith("Local"):
+            base = self.mode
+        else:
+            base = "Cloud"
         if self.white_mode:
             return f"{base} White"
         return base
@@ -1446,6 +1479,7 @@ class MutterScreenSync:
                 continue
 
             try:
+                setup_adb_forward(self.port)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 s.connect((HOST, self.port))
