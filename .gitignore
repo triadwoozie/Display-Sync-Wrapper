@@ -23,3 +23,6 @@ Thumbs.db
 *.log
 .idea/
 *.iml
+
+# Tuya Cloud Credentials
+tuya_config.json

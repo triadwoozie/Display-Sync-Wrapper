@@ -77,6 +77,12 @@ Display-Sync-Wrapper/
 - Android 8.0+ (API 26+)
 - USB Debugging enabled in Developer Options
 
+### 💡 Tuya Smart Bulb Sync
+- **Exponential Smoothing**: Glides colors softly using an exponential moving average (EMA) filter, preventing jerky or jarring bulb transitions.
+- **Rate-Limited Dispatcher**: Decoupled from the 30 FPS phone stream, sending updates to Tuya Cloud at 2 Hz (every 500ms) with deadband filtering to respect cloud latency and API quotas.
+- **Hardware Brightness Clamped**: Brightness slider range is strictly 30% to 100% to keep the bulb visible and prevent low-voltage cutoff.
+- **Interactive Web Slider**: Built-in dark-mode slider accessible at `http://localhost:5556` for instant live brightness control from your browser or phone.
+
 ---
 
 ## Quick Start
@@ -90,7 +96,20 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.flashlight.torch/.MainActivity
 ```
 
-### 2. Start the Linux Sender
+### 2. Configure Tuya Smart Bulb (Optional)
+Fill in your credentials in `tuya_config.json`:
+```json
+{
+  "enabled": true,
+  "access_id": "YOUR_TUYA_ACCESS_ID",
+  "access_secret": "YOUR_TUYA_ACCESS_SECRET",
+  "device_id": "YOUR_TUYA_DEVICE_ID",
+  "region": "in",
+  "brightness": 70
+}
+```
+
+### 3. Start the Linux Sender
 From the repository root:
 ```bash
 ./run_sender.sh
@@ -98,6 +117,12 @@ From the repository root:
 
 Optional flags:
 ```bash
+# Adjust Tuya bulb brightness (30-100%)
+./run_sender.sh --tuya-brightness 80
+
+# Sync only Tuya bulb (skip phone connection)
+./run_sender.sh --no-phone
+
 # Target custom framerate
 ./run_sender.sh --fps 60
 
@@ -105,7 +130,7 @@ Optional flags:
 ./run_sender.sh --simulate-vibration
 
 # Explicitly bind to a specific controller event node
-./run_sender.sh --controller /dev/input/event12
+./run_sender.sh --controller /dev/input/event17
 ```
 
 ---
