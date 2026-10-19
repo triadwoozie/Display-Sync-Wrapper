@@ -7,8 +7,8 @@
 nmcli connection modify Hotspot 802-11-wireless.powersave 2 2>/dev/null || true
 iw dev wlp2s0 set power_save off 2>/dev/null || true
 
-# 2. Start InputLeap client in background with elevated process priority (-10)
-pgrep -x input-leapc >/dev/null || nice -n -10 input-leapc --name compooter 10.42.0.183 &
+# 2. Start InputLeap client in background if not already running
+pgrep -x input-leapc >/dev/null || input-leapc --name compooter 10.42.0.183 &
 
 set -e
 
