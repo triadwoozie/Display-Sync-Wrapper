@@ -37,7 +37,7 @@ else
 fi
 
 # 4. Check Python dependencies
-python3 -c "import numpy, gi, evdev, requests" 2>/dev/null || {
+python3 -c "import numpy, gi, evdev, requests, tinytuya" 2>/dev/null || {
     echo "[!] Missing one or more Python dependencies."
     echo "    Install system packages or pip packages:"
     echo "    - Fedora/Nobara: sudo dnf install python3-numpy python3-gobject python3-evdev python3-requests gstreamer1-plugins-good pipewire-gstreamer"

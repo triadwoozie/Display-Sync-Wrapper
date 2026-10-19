@@ -39,6 +39,12 @@ try:
 except ImportError:
     HAS_EVDEV = False
 
+try:
+    import tinytuya
+    HAS_TINYTUYA = True
+except ImportError:
+    HAS_TINYTUYA = False
+
 HOST = "127.0.0.1"
 PORT = 5555
 FPS_TARGET = 30
@@ -199,10 +205,88 @@ def monitor_controller_vibration(device_path=None, simulate=False):
 
 
 # ==============================================================================
-# Tuya Cloud API & Smart Bulb Synchronizer
+# ==============================================================================
+# Tuya Local (Wi-Fi Persistent Socket) & Cloud API Smart Bulb Synchronizer
 # ==============================================================================
 
+class TuyaLocalDevice:
+    """
+    Controls Tuya bulb directly over local Wi-Fi router using tinytuya.BulbDevice
+    with a persistent TCP socket (~10-15 Hz, sub-10ms latency).
+    """
+    def __init__(self, device_id: str, local_ip: str, local_key: str, version: float = 3.5):
+        self.device_id = device_id.strip()
+        self.local_ip = local_ip.strip()
+        self.local_key = local_key.strip()
+        self.version = float(version)
+        self.bulb = None
+        self.is_connected = False
+        self.lock = threading.Lock()
+        self.last_attempt_time = 0
+
+    def connect(self) -> bool:
+        if not HAS_TINYTUYA or not self.local_ip or not self.local_key:
+            return False
+        with self.lock:
+            now = time.time()
+            if now - self.last_attempt_time < 3.0:
+                return False
+            self.last_attempt_time = now
+
+            try:
+                # Persistent socket direct connection to local bulb on port 6668
+                self.bulb = tinytuya.BulbDevice(
+                    dev_id=self.device_id,
+                    address=self.local_ip,
+                    local_key=self.local_key,
+                    version=self.version,
+                    persist=True
+                )
+                self.bulb.set_version(self.version)
+                self.bulb.set_socketPersistent(True)
+                # Ensure bulb is powered on in colour mode
+                self.bulb.set_multiple_values({'20': True, '21': 'colour'}, nowait=True)
+                self.is_connected = True
+                return True
+            except Exception:
+                self.is_connected = False
+                self.bulb = None
+                return False
+
+    def send_hsv(self, h: int, s: int, v: int) -> bool:
+        """Sends HSV color directly over local Wi-Fi TCP socket (non-blocking nowait=True)."""
+        if not self.is_connected or not self.bulb:
+            if not self.connect():
+                return False
+
+        hex_val = f"{int(h):04x}{int(s):04x}{int(v):04x}"
+        with self.lock:
+            try:
+                self.bulb.set_value('24', hex_val, nowait=True)
+                return True
+            except Exception:
+                self.is_connected = False
+                try:
+                    if self.bulb:
+                        self.bulb.close()
+                except Exception:
+                    pass
+                self.bulb = None
+                return False
+
+    def close(self):
+        with self.lock:
+            if self.bulb:
+                try:
+                    self.bulb.close()
+                except Exception:
+                    pass
+                self.bulb = None
+            self.is_connected = False
+
+
 class TuyaCloudClient:
+    """Fallback Tuya Cloud OpenAPI client (rate-limited ~2 Hz)."""
     def __init__(self, access_id: str, access_secret: str, device_id: str, region: str = "in"):
         self.access_id = access_id.strip()
         self.access_secret = access_secret.strip()
@@ -258,7 +342,7 @@ class TuyaCloudClient:
                 raise RuntimeError(f"Tuya Cloud connection error ({self.base_url}): {e}")
 
     def send_color(self, h: int, s: int, v: int) -> bool:
-        """Sends HSV color to bulb. h: [0..360], s: [0..1000], v: [300..1000]."""
+        """Sends HSV color to bulb via cloud OpenAPI."""
         try:
             token = self.get_token()
         except Exception:
@@ -286,7 +370,6 @@ class TuyaCloudClient:
             })
 
         payload = {"commands": commands}
-
         body_str = json.dumps(payload, separators=(',', ':'))
         body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
 
@@ -308,24 +391,31 @@ class TuyaCloudClient:
             data = resp.json()
             if data.get("success"):
                 return True
-
             if data.get("code") in (1010, 1011, 1012):
                 self.get_token(force_refresh=True)
                 return False
-
             if not self.use_legacy_code and data.get("code") in (1106, 2001, 2008):
                 self.use_legacy_code = True
                 return self.send_color(h, s, v)
-
             return False
         except Exception:
             return False
 
 
 class TuyaBulbSync:
-    """Handles color smoothing (EMA filter), rate limiting (2 Hz), and web brightness slider."""
+    """
+    Tuya Smart Bulb Controller:
+    - Direct Wi-Fi local socket via tinytuya.BulbDevice (persistent TCP, ~12 Hz)
+    - Full color range expansion: saturation weighting so colors pop and never wash out to white
+    - Dynamic brightness shifts: bulb scales dynamically with screen luminance (clamped 30%-100%)
+    - Smooth gradient easing: shortest circular path Hue and linear Saturation/Value interpolation
+    - Fallback: Tuya Cloud OpenAPI if local network is unavailable
+    - Web slider server: real-time brightness and dynamic mode control at http://localhost:5556
+    """
     def __init__(self, config_path: str = CONFIG_FILE, cli_brightness: int = None,
-                 cli_id: str = None, cli_secret: str = None, cli_device: str = None, cli_region: str = None):
+                 cli_id: str = None, cli_secret: str = None, cli_device: str = None,
+                 cli_region: str = None, cli_ip: str = None, cli_key: str = None,
+                 cli_dynamic: bool = None):
         self.config_path = config_path
         self.config = self.load_config()
 
@@ -342,6 +432,15 @@ class TuyaBulbSync:
         if cli_region:
             self.config["region"] = cli_region
             changed = True
+        if cli_ip:
+            self.config["local_ip"] = cli_ip
+            changed = True
+        if cli_key:
+            self.config["local_key"] = cli_key
+            changed = True
+        if cli_dynamic is not None:
+            self.config["dynamic_brightness"] = cli_dynamic
+            changed = True
         if cli_brightness is not None:
             self.config["brightness"] = max(30, min(100, int(cli_brightness)))
             changed = True
@@ -349,38 +448,101 @@ class TuyaBulbSync:
         if changed:
             self.save_config()
 
-        self.enabled = bool(self.config.get("enabled", True) and self.config.get("access_id") and self.config.get("device_id"))
+        self.device_id = self.config.get("device_id", "")
+        self.local_ip = self.config.get("local_ip", "")
+        self.local_key = self.config.get("local_key", "")
+        self.protocol_version = float(self.config.get("protocol_version", 3.5))
+
+        self.enabled = bool(self.config.get("enabled", True) and self.device_id)
         self.brightness = max(30, min(100, int(self.config.get("brightness", 70))))
+        self.min_brightness = max(30, int(self.config.get("min_brightness", 30)))
+        self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
+        self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
+        self.saturation_boost = float(self.config.get("saturation_boost", 1.8))
         self.alpha = float(self.config.get("smoothing_alpha", 0.20))
-        self.refresh_interval = float(self.config.get("refresh_interval_sec", 0.50))
+        self.local_hz = float(self.config.get("local_refresh_hz", 12.0))
+        self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
-        self.target_rgb = [0.0, 0.0, 0.0]
-        self.current_rgb = [0.0, 0.0, 0.0]
+        # Target color from screen frame
+        self.target_h = 0.0      # [0.0 .. 1.0]
+        self.target_s = 0.0      # [0.0 .. 1.0]
+        self.target_lum = 0.5    # [0.0 .. 1.0]
+
+        # Current smoothed color state
+        self.curr_h = 0.0        # [0.0 .. 360.0]
+        self.curr_s = 0.0        # [0.0 .. 1000.0]
+        self.curr_v = float(self.brightness * 10)  # [300.0 .. 1000.0]
         self.last_sent_hsv = (-1, -1, -1)
+        self.current_display_b = self.brightness
+
         self.lock = threading.Lock()
         self.running = False
-        self.client = None
+
+        self.local_device = None
+        self.cloud_client = None
+        self.mode = "Inactive"
 
         if self.enabled:
-            self.client = TuyaCloudClient(
-                access_id=self.config["access_id"],
-                access_secret=self.config["access_secret"],
-                device_id=self.config["device_id"],
-                region=self.config.get("region", "in")
+            # Auto-retrieve local key from Cloud if missing but cloud credentials exist
+            if HAS_TINYTUYA and not self.local_key and self.config.get("access_id") and self.config.get("access_secret"):
+                self._fetch_local_key_from_cloud()
+
+            # Initialize local device
+            if HAS_TINYTUYA and self.local_ip and self.local_key:
+                self.local_device = TuyaLocalDevice(
+                    device_id=self.device_id,
+                    local_ip=self.local_ip,
+                    local_key=self.local_key,
+                    version=self.protocol_version
+                )
+
+            # Initialize cloud client as fallback
+            if self.config.get("access_id") and self.config.get("access_secret"):
+                self.cloud_client = TuyaCloudClient(
+                    access_id=self.config["access_id"],
+                    access_secret=self.config["access_secret"],
+                    device_id=self.device_id,
+                    region=self.config.get("region", "in")
+                )
+
+    def _fetch_local_key_from_cloud(self):
+        """Fetches local_key via Tuya OpenAPI if credentials are present and saves it."""
+        try:
+            cloud = tinytuya.Cloud(
+                apiRegion=self.config.get("region", "in"),
+                apiKey=self.config.get("access_id"),
+                apiSecret=self.config.get("access_secret"),
+                apiDeviceID=self.device_id
             )
+            devices = cloud.getdevices()
+            for dev in devices:
+                if dev.get("id") == self.device_id and dev.get("key"):
+                    self.local_key = dev["key"]
+                    self.config["local_key"] = dev["key"]
+                    self.save_config()
+                    print("[+] Retrieved local key for Tuya device from cloud.")
+                    break
+        except Exception:
+            pass
 
     def load_config(self) -> dict:
         default = {
             "enabled": True,
+            "device_id": "",
+            "local_key": "",
+            "local_ip": "",
+            "protocol_version": 3.5,
             "access_id": "",
             "access_secret": "",
-            "device_id": "",
             "region": "in",
             "brightness": 70,
             "min_brightness": 30,
             "max_brightness": 100,
+            "dynamic_brightness": True,
+            "saturation_boost": 1.8,
             "smoothing_alpha": 0.20,
+            "local_refresh_hz": 12,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -404,71 +566,186 @@ class TuyaBulbSync:
             pass
 
     def set_brightness(self, value: int):
-        clamped = max(30, min(100, int(value)))
+        clamped = max(self.min_brightness, min(self.max_brightness, int(value)))
         with self.lock:
             self.brightness = clamped
             self.config["brightness"] = clamped
         self.save_config()
 
-    def update_screen_color(self, r: int, g: int, b: int):
+    def set_dynamic_brightness(self, enable: bool):
+        with self.lock:
+            self.dynamic_brightness = bool(enable)
+            self.config["dynamic_brightness"] = self.dynamic_brightness
+        self.save_config()
+
+    def update_frame(self, arr: np.ndarray):
+        """
+        Extracts saturation-weighted dominant color and screen luminance for dynamic brightness.
+        Separates color extraction from phone's flat average so the bulb utilizes its full gamut.
+        """
         if not self.enabled:
             return
-        with self.lock:
-            self.target_rgb = [float(r), float(g), float(b)]
 
-    def _smoothing_loop(self):
-        """Softens rapid color jumps using exponential smoothing (EMA)."""
-        dt = 0.04  # 25 updates per second
-        while self.running:
+        try:
+            rgb_norm = arr.astype(np.float32) / 255.0
+            r = rgb_norm[..., 0]
+            g = rgb_norm[..., 1]
+            b = rgb_norm[..., 2]
+
+            cmax = np.maximum(np.maximum(r, g), b)
+            cmin = np.minimum(np.minimum(r, g), b)
+            delta = cmax - cmin
+
+            sat = np.zeros_like(cmax)
+            mask = cmax > 0.001
+            sat[mask] = delta[mask] / cmax[mask]
+
+            hue = np.zeros_like(cmax)
+            mask_r = (cmax == r) & (delta > 0.0001)
+            mask_g = (cmax == g) & (delta > 0.0001)
+            mask_b = (cmax == b) & (delta > 0.0001)
+
+            hue[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0
+            hue[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2.0
+            hue[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4.0
+            hue = hue / 6.0
+
+            val = cmax
+
+            # Perceived screen luminance for dynamic brightness
+            luminance = float(np.mean(0.2126 * r + 0.7152 * g + 0.0722 * b))
+
+            # Weight by sat^2 * val + 0.01 so vibrant colors dominate over neutral white/gray UI
+            weights = (sat ** 2) * val + 0.01
+            w_sum = weights.sum()
+            if w_sum > 0:
+                weights /= w_sum
+            else:
+                weights = np.full_like(weights, 1.0 / weights.size)
+
+            # Circular weighted mean for Hue
+            angles = hue * 2.0 * np.pi
+            x = np.sum(weights * np.cos(angles))
+            y = np.sum(weights * np.sin(angles))
+            weighted_h = float((np.arctan2(y, x) / (2.0 * np.pi)) % 1.0)
+
+            # Weighted saturation with expansion curve
+            weighted_s = float(np.sum(weights * sat))
+            if weighted_s < 0.025:
+                # True grayscale/white screen
+                boosted_s = 0.0
+            else:
+                boosted_s = min(1.0, (weighted_s ** 0.65) * self.saturation_boost)
+
             with self.lock:
-                for i in range(3):
-                    self.current_rgb[i] += self.alpha * (self.target_rgb[i] - self.current_rgb[i])
-            time.sleep(dt)
+                self.target_h = weighted_h
+                self.target_s = boosted_s
+                self.target_lum = luminance
+        except Exception:
+            pass
 
-    def _dispatcher_loop(self):
-        """Dispatches rate-limited updates to Tuya Cloud without blocking screen sync."""
-        time.sleep(1.0)
+    def _gradient_sync_loop(self):
+        """
+        Runs smooth gradient interpolation towards target HSV and streams to the bulb
+        over persistent TCP socket (or rate-limited Cloud fallback).
+        """
+        time.sleep(0.5)
         while self.running:
-            time.sleep(self.refresh_interval)
-            if not self.enabled or not self.client:
+            is_local = (self.local_device is not None and self.local_device.is_connected)
+            interval = (1.0 / self.local_hz) if is_local else self.cloud_refresh
+            time.sleep(interval)
+
+            if not self.enabled:
                 continue
 
             with self.lock:
-                r, g, b = self.current_rgb
+                th = self.target_h
+                ts = self.target_s
+                tlum = self.target_lum
                 bright_pct = self.brightness
+                alpha = self.alpha
+                dyn = self.dynamic_brightness
+                min_b = self.min_brightness
+                max_b = self.max_brightness
 
-            r_norm, g_norm, b_norm = r / 255.0, g / 255.0, b / 255.0
-            h, s, v = colorsys.rgb_to_hsv(r_norm, g_norm, b_norm)
+            # 1. Compute dynamic brightness target
+            if dyn:
+                eff_brightness = min_b + (bright_pct - min_b) * tlum
+                target_v = max(float(min_b), min(float(max_b), eff_brightness))
+            else:
+                target_v = float(bright_pct)
 
-            h_deg = int(h * 360)
-            s_tuya = int(s * 1000)
-            # Minimum brightness clamped to 30% (300) to prevent bulb shutoff
-            v_tuya = int(max(300, min(1000, bright_pct * 10)))
+            # 2. Smooth gradient interpolation (circular shortest-path for Hue)
+            target_h_deg = th * 360.0
+            diff_h = (target_h_deg - self.curr_h + 180.0) % 360.0 - 180.0
+            self.curr_h = (self.curr_h + alpha * diff_h) % 360.0
 
-            if v < 0.05:
-                v_tuya = 300
+            # Linear smoothing for Saturation & Value
+            target_s_tuya = ts * 1000.0
+            self.curr_s += alpha * (target_s_tuya - self.curr_s)
 
+            target_v_tuya = target_v * 10.0
+            self.curr_v += alpha * (target_v_tuya - self.curr_v)
+
+            # 3. Format Tuya HSV (V clamped to min 30% = 300)
+            h_tuya = int(self.curr_h) % 360
+            s_tuya = int(max(0, min(1000, self.curr_s)))
+            v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
+            self.current_display_b = int(v_tuya / 10)
+
+            # 4. Deadband check: send if changed
             last_h, last_s, last_v = self.last_sent_hsv
-            if abs(h_deg - last_h) >= 4 or abs(s_tuya - last_s) >= 20 or abs(v_tuya - last_v) >= 20:
-                success = self.client.send_color(h_deg, s_tuya, v_tuya)
-                if success:
-                    self.last_sent_hsv = (h_deg, s_tuya, v_tuya)
+            threshold = 2 if is_local else 6
+            if abs(h_tuya - last_h) >= threshold or abs(s_tuya - last_s) >= (threshold * 3) or abs(v_tuya - last_v) >= (threshold * 3):
+                sent = False
+                if self.local_device:
+                    sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
+                    if sent:
+                        self.mode = "Local Wi-Fi"
+
+                if not sent and self.cloud_client:
+                    # Cloud fallback
+                    sent = self.cloud_client.send_color(h_tuya, s_tuya, v_tuya)
+                    if sent:
+                        self.mode = "Cloud OpenAPI"
+
+                if sent:
+                    self.last_sent_hsv = (h_tuya, s_tuya, v_tuya)
 
     def start(self):
         if not self.enabled:
-            print("[!] Tuya bulb sync is disabled or credentials missing in tuya_config.json")
             return
 
-        print(f"[+] Tuya Bulb Sync Active: Device {self.client.device_id[:6]}... (Region: {self.config.get('region')})")
-        print(f"[+] Tuya Brightness: {self.brightness}% (Clamped 30% - 100%)")
         self.running = True
 
-        threading.Thread(target=self._smoothing_loop, daemon=True).start()
-        threading.Thread(target=self._dispatcher_loop, daemon=True).start()
+        # Try initial local connect
+        if self.local_device:
+            if self.local_device.connect():
+                self.mode = "Local Wi-Fi"
+                print(f"[+] Tuya Bulb Local Sync Active: {self.local_ip}:6668 (Persistent TCP, ~{int(self.local_hz)}Hz)")
+            else:
+                print(f"[!] Local connection to {self.local_ip} pending, falling back to Cloud if needed.")
+
+        if self.mode != "Local Wi-Fi" and self.cloud_client:
+            self.mode = "Cloud OpenAPI"
+            print(f"[+] Tuya Bulb Cloud Sync Active: Device {self.device_id[:6]}... (Region: {self.config.get('region')})")
+
+        dyn_str = "Dynamic Brightness" if self.dynamic_brightness else "Static Brightness"
+        print(f"[+] Tuya Brightness: {self.brightness}% ({dyn_str}, Min {self.min_brightness}%)")
+
+        threading.Thread(target=self._gradient_sync_loop, daemon=True).start()
         self._start_web_server()
 
     def stop(self):
         self.running = False
+        if self.local_device:
+            self.local_device.close()
+
+    def mode_short(self) -> str:
+        return "Local" if self.mode == "Local Wi-Fi" else "Cloud"
+
+    def current_brightness_display(self) -> int:
+        return self.current_display_b
 
     def _start_web_server(self):
         sync_self = self
@@ -482,14 +759,21 @@ class TuyaBulbSync:
                 if parsed.path == "/":
                     with sync_self.lock:
                         b = sync_self.brightness
-                        r, g, b_val = [int(c) for c in sync_self.current_rgb]
+                        dyn = sync_self.dynamic_brightness
+                        mode_str = sync_self.mode
+                        h_norm = (sync_self.curr_h % 360.0) / 360.0
+                        s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
+                        v_norm = max(0.0, min(1.0, sync_self.curr_v / 1000.0))
+                        r_f, g_f, b_f = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
+                        r_d, g_d, b_d = int(r_f * 255), int(g_f * 255), int(b_f * 255)
 
+                    dyn_checked = "checked" if dyn else ""
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Tuya Bulb Ambient Slider</title>
+    <title>Tuya Bulb Ambient Sync</title>
     <style>
         body {{
             background: #111116;
@@ -506,7 +790,7 @@ class TuyaBulbSync:
             padding: 30px;
             border-radius: 20px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.6);
-            width: 320px;
+            width: 330px;
             text-align: center;
             border: 1px solid rgba(255,255,255,0.08);
         }}
@@ -519,16 +803,16 @@ class TuyaBulbSync:
             border-radius: 12px;
             font-size: 11px;
             font-weight: bold;
-            margin-bottom: 20px;
+            margin-bottom: 15px;
         }}
         .swatch {{
             width: 70px;
             height: 70px;
             border-radius: 50%;
-            margin: 15px auto;
+            margin: 10px auto 15px;
             border: 3px solid rgba(255,255,255,0.2);
-            transition: background 0.3s ease;
-            background: rgb({r},{g},{b_val});
+            transition: background 0.15s ease;
+            background: rgb({r_d},{g_d},{b_d});
         }}
         .val {{
             font-size: 32px;
@@ -539,11 +823,21 @@ class TuyaBulbSync:
         }}
         input[type=range] {{
             width: 100%;
-            margin: 20px 0 10px;
+            margin: 15px 0 10px;
             accent-color: #ffb300;
             height: 8px;
             border-radius: 4px;
             outline: none;
+        }}
+        .toggle-box {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255,255,255,0.05);
+            padding: 10px 14px;
+            border-radius: 12px;
+            margin: 15px 0;
+            font-size: 13px;
         }}
         .sub {{
             color: rgba(255,255,255,0.45);
@@ -555,11 +849,15 @@ class TuyaBulbSync:
 <body>
     <div class="card">
         <h2>💡 Tuya Bulb Sync</h2>
-        <div class="badge">ACTIVE & SMOOTHED</div>
+        <div class="badge" id="mode-badge">{mode_str}</div>
         <div class="swatch" id="swatch"></div>
         <div class="sub">Brightness Control</div>
         <div class="val" id="val">{b}%</div>
         <input type="range" min="30" max="100" value="{b}" id="slider" oninput="update(this.value)">
+        <div class="toggle-box">
+            <span>Dynamic Brightness</span>
+            <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
+        </div>
         <div class="sub">Clamped: Minimum 30% prevents bulb cutoff</div>
     </div>
     <script>
@@ -567,13 +865,17 @@ class TuyaBulbSync:
             document.getElementById('val').innerText = v + '%';
             fetch('/brightness?val=' + v);
         }}
+        function toggleDyn(checked) {{
+            fetch('/dynamic?val=' + (checked ? '1' : '0'));
+        }}
         setInterval(async () => {{
             try {{
                 let r = await fetch('/status');
                 let d = await r.json();
                 document.getElementById('swatch').style.background = 'rgb(' + d.r + ',' + d.g + ',' + d.b + ')';
+                document.getElementById('mode-badge').innerText = d.mode;
             }} catch(e) {{}}
-        }}, 800);
+        }}, 400);
     </script>
 </body>
 </html>"""
@@ -594,14 +896,35 @@ class TuyaBulbSync:
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok"}')
 
-                elif parsed.path == "/status":
-                    with sync_self.lock:
-                        b = sync_self.brightness
-                        r, g, b_val = [int(c) for c in sync_self.current_rgb]
+                elif parsed.path == "/dynamic":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_dynamic_brightness(qs["val"][0] == "1")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"brightness": b, "r": r, "g": g, "b": b_val}).encode('utf-8'))
+                    self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/status":
+                    with sync_self.lock:
+                        b = sync_self.brightness
+                        dyn = sync_self.dynamic_brightness
+                        mode_str = sync_self.mode
+                        h_norm = (sync_self.curr_h % 360.0) / 360.0
+                        s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
+                        v_norm = max(0.0, min(1.0, sync_self.curr_v / 1000.0))
+                        r_f, g_f, b_f = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
+                        r_d, g_d, b_d = int(r_f * 255), int(g_f * 255), int(b_f * 255)
+
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "brightness": b,
+                        "dynamic": dyn,
+                        "mode": mode_str,
+                        "r": r_d, "g": g_d, "b": b_d
+                    }).encode('utf-8'))
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -623,7 +946,8 @@ class TuyaBulbSync:
 
 class MutterScreenSync:
     def __init__(self, port=PORT, fps=FPS_TARGET, auto_dismiss_ui=True, skip_phone=False,
-                 tuya_brightness=None, tuya_id=None, tuya_secret=None, tuya_device=None, tuya_region=None):
+                 tuya_brightness=None, tuya_id=None, tuya_secret=None, tuya_device=None,
+                 tuya_region=None, tuya_ip=None, tuya_key=None, tuya_dynamic=None):
         self.port = port
         self.fps = fps
         self.auto_dismiss_ui = auto_dismiss_ui
@@ -644,7 +968,10 @@ class MutterScreenSync:
                 cli_id=tuya_id,
                 cli_secret=tuya_secret,
                 cli_device=tuya_device,
-                cli_region=tuya_region
+                cli_region=tuya_region,
+                cli_ip=tuya_ip,
+                cli_key=tuya_key,
+                cli_dynamic=tuya_dynamic
             )
             if self.tuya.enabled:
                 self.tuya.start()
@@ -683,6 +1010,8 @@ class MutterScreenSync:
         try:
             # 16x9 x 3 bytes RGB = 432 bytes total
             arr = np.frombuffer(map_info.data, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
+
+            # Phone Ambient Color (Strictly UNCHANGED)
             avg_rgb = arr.mean(axis=(0, 1)).astype(np.uint8)
             r, g, b = int(avg_rgb[0]), int(avg_rgb[1]), int(avg_rgb[2])
 
@@ -702,14 +1031,14 @@ class MutterScreenSync:
                         pass
                     self.sock = None
 
-            # 2. Feed to Tuya bulb smoothing worker
+            # 2. Feed frame to Tuya bulb controller (Saturation expansion + dynamic brightness + gradient easing)
             if self.tuya and self.tuya.enabled:
-                self.tuya.update_screen_color(r, g, b)
+                self.tuya.update_frame(arr)
 
             # 3. Terminal status display
             if (r, g, b) != self.last_rgb:
                 self.last_rgb = (r, g, b)
-                bulb_str = f" | Bulb: {self.tuya.brightness}%" if (self.tuya and self.tuya.enabled) else ""
+                bulb_str = f" | Bulb ({self.tuya.mode_short()}): {self.tuya.current_brightness_display()}%" if (self.tuya and self.tuya.enabled) else ""
                 phone_str = " | Phone: Active" if self.sock else " | Phone: Connecting..."
                 print(f"\r[*] Screen Sync -> RGB: ({r:3d}, {g:3d}, {b:3d}) | Vibe: {vibe:3d}{phone_str}{bulb_str}   ", end="", flush=True)
 
@@ -832,6 +1161,10 @@ def main():
     parser.add_argument("--tuya-secret", type=str, default=None, help="Tuya Cloud Access Secret")
     parser.add_argument("--tuya-device", type=str, default=None, help="Tuya Bulb Device ID")
     parser.add_argument("--tuya-region", type=str, default=None, help="Tuya Cloud Region (in, us, eu, cn)")
+    parser.add_argument("--tuya-ip", type=str, default=None, help="Tuya bulb local IP on Wi-Fi (e.g. 192.168.1.74)")
+    parser.add_argument("--tuya-key", type=str, default=None, help="Tuya bulb local 16-character encryption key")
+    parser.add_argument("--tuya-dynamic", action="store_true", default=None, help="Enable dynamic brightness shifts")
+    parser.add_argument("--no-tuya-dynamic", dest="tuya_dynamic", action="store_false", help="Disable dynamic brightness shifts")
     args = parser.parse_args()
 
     # 1. Unlock phone and launch app if not skipped
@@ -847,7 +1180,10 @@ def main():
         tuya_id=args.tuya_id,
         tuya_secret=args.tuya_secret,
         tuya_device=args.tuya_device,
-        tuya_region=args.tuya_region
+        tuya_region=args.tuya_region,
+        tuya_ip=args.tuya_ip,
+        tuya_key=args.tuya_key,
+        tuya_dynamic=args.tuya_dynamic
     )
 
     # 2. Signal handlers for clean exit on Ctrl-C or SIGTERM
