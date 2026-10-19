@@ -47,7 +47,7 @@ except ImportError:
 
 HOST = "127.0.0.1"
 PORT = 5555
-FPS_TARGET = 30
+FPS_TARGET = 60
 
 WIDTH = 16
 HEIGHT = 9
@@ -678,7 +678,7 @@ class TuyaBulbSync:
             self.config["brightness"] = max(10, min(100, int(cli_brightness)))
             changed = True
         if cli_hz is not None:
-            self.config["local_refresh_hz"] = max(2.0, min(14.0, float(cli_hz)))
+            self.config["local_refresh_hz"] = max(2.0, min(30.0, float(cli_hz)))
             changed = True
 
         if changed:
@@ -696,9 +696,9 @@ class TuyaBulbSync:
         self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
         self.dynamic_brightness = bool(self.config.get("dynamic_brightness", True))
         self.phone_flash_enabled = bool(self.config.get("phone_flash_enabled", True))
-        self.alpha = float(self.config.get("smoothing_alpha", 0.25))
-        raw_hz = float(self.config.get("local_refresh_hz", 14.0))
-        self.local_hz = max(2.0, min(14.0, raw_hz))
+        self.alpha = float(self.config.get("smoothing_alpha", 0.45))
+        raw_hz = float(self.config.get("local_refresh_hz", 15.0))
+        self.local_hz = max(2.0, min(30.0, raw_hz))
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
@@ -800,8 +800,8 @@ class TuyaBulbSync:
             "white_mode": False,
             "white_temp": 500,
             "saturation_boost": 1.8,
-            "smoothing_alpha": 0.50,
-            "local_refresh_hz": 14.0,
+            "smoothing_alpha": 0.45,
+            "local_refresh_hz": 15.0,
             "refresh_interval_sec": 0.50,
             "web_slider_port": 5556
         }
@@ -829,6 +829,13 @@ class TuyaBulbSync:
         with self.lock:
             self.brightness = clamped
             self.config["brightness"] = clamped
+        self.save_config()
+
+    def set_refresh_hz(self, hz: float):
+        clamped = max(2.0, min(30.0, float(hz)))
+        with self.lock:
+            self.local_hz = clamped
+            self.config["local_refresh_hz"] = clamped
         self.save_config()
 
     def set_dynamic_brightness(self, enable: bool):
@@ -1073,8 +1080,10 @@ class TuyaBulbSync:
 
             # 4. Deadband check: send if changed
             last_h, last_s, last_v = self.last_sent_hsv
-            threshold = 2 if is_local else 5
-            if abs(h_tuya - last_h) >= threshold or abs(s_tuya - last_s) >= 8 or abs(v_tuya - last_v) >= 6:
+            th_h = 1 if is_local else 3
+            th_s = 2 if is_local else 8
+            th_v = 2 if is_local else 6
+            if abs(h_tuya - last_h) >= th_h or abs(s_tuya - last_s) >= th_s or abs(v_tuya - last_v) >= th_v:
                 sent = False
                 if self.local_device:
                     sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
@@ -1154,6 +1163,7 @@ class TuyaBulbSync:
                         white = sync_self.white_mode
                         eth = sync_self.use_ethernet_only
                         power = sync_self.power_on
+                        cur_hz = sync_self.local_hz
                         mode_str = sync_self.mode
                         if not power:
                             r_d, g_d, b_d = 40, 40, 40
@@ -1172,6 +1182,8 @@ class TuyaBulbSync:
                     white_checked = "checked" if white else ""
                     eth_checked = "checked" if eth else ""
                     power_checked = "checked" if power else ""
+                    hz_options = [10, 12, 14, 15, 18, 20]
+                    hz_options_html = "".join([f'<option value="{opt}"{" selected" if int(round(cur_hz)) == opt else ""}>{opt} Hz</option>' for opt in hz_options])
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1264,6 +1276,12 @@ class TuyaBulbSync:
             <input type="checkbox" id="power-toggle" {power_checked} onchange="togglePower(this.checked)">
         </div>
         <div class="toggle-box">
+            <span>Refresh Rate</span>
+            <select id="hz-select" style="background:#282836; color:#ffb300; border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:3px 8px; font-weight:bold; outline:none; font-size:12px;" onchange="updateHz(this.value)">
+                {hz_options_html}
+            </select>
+        </div>
+        <div class="toggle-box">
             <span>Ethernet Only (Isolate Hotspot)</span>
             <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
         </div>
@@ -1285,6 +1303,9 @@ class TuyaBulbSync:
         function update(v) {{
             document.getElementById('val').innerText = v + '%';
             fetch('/brightness?val=' + v);
+        }}
+        function updateHz(v) {{
+            fetch('/refresh_hz?val=' + v);
         }}
         function togglePower(checked) {{
             fetch('/power_toggle?val=' + (checked ? '1' : '0'));
@@ -1308,6 +1329,10 @@ class TuyaBulbSync:
                 let d = await r.json();
                 document.getElementById('swatch').style.background = 'rgb(' + d.r + ',' + d.g + ',' + d.b + ')';
                 document.getElementById('mode-badge').innerText = d.mode;
+                let hzSelect = document.getElementById('hz-select');
+                if (hzSelect && document.activeElement !== hzSelect && d.refresh_hz) {{
+                    hzSelect.value = String(Math.round(d.refresh_hz));
+                }}
             }} catch(e) {{}}
         }}
         setInterval(fetchStatus, 5000);
@@ -1324,6 +1349,18 @@ class TuyaBulbSync:
                     if "val" in qs:
                         try:
                             sync_self.set_brightness(int(qs["val"][0]))
+                        except Exception:
+                            pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/refresh_hz":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        try:
+                            sync_self.set_refresh_hz(float(qs["val"][0]))
                         except Exception:
                             pass
                     self.send_response(200)
@@ -1385,6 +1422,7 @@ class TuyaBulbSync:
                         eth = sync_self.use_ethernet_only
                         eth_ip = sync_self.ethernet_ip
                         power = sync_self.power_on
+                        cur_hz = sync_self.local_hz
                         mode_str = sync_self.mode
                         if not power:
                             r_d, g_d, b_d = 40, 40, 40
@@ -1409,6 +1447,7 @@ class TuyaBulbSync:
                         "ethernet_only": eth,
                         "ethernet_ip": eth_ip,
                         "power": power,
+                        "refresh_hz": cur_hz,
                         "mode": display_mode,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
