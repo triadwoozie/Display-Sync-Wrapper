@@ -410,6 +410,24 @@ class TuyaLocalDevice:
                 self.bulb = None
                 return False
 
+    def set_power(self, power: bool) -> bool:
+        """Powers the bulb on or off."""
+        if not self.is_connected or not self.bulb:
+            if power and not self.connect():
+                return False
+        with self.lock:
+            try:
+                if self.bulb:
+                    if power:
+                        self.bulb.turn_on(nowait=True)
+                    else:
+                        self.bulb.turn_off(nowait=True)
+                    self._drain_socket()
+                    return True
+                return False
+            except Exception:
+                return False
+
     def close(self):
         with self.lock:
             if self.bulb:
@@ -574,6 +592,39 @@ class TuyaCloudClient:
         except Exception:
             return False
 
+    def set_power(self, power: bool) -> bool:
+        """Powers the bulb on or off via Tuya Cloud OpenAPI."""
+        try:
+            token = self.get_token()
+        except Exception:
+            return False
+
+        now = time.time()
+        t = str(int(now * 1000))
+        commands = [{"code": "switch_led", "value": bool(power)}]
+        payload = {"commands": commands}
+        body_str = json.dumps(payload, separators=(',', ':'))
+        body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
+
+        path = f"/v1.0/iot-03/devices/{self.device_id}/commands"
+        string_to_sign = f"{self.access_id}{token}{t}POST\n{body_hash}\n\n{path}"
+        sign = self._calc_sign(string_to_sign)
+
+        headers = {
+            "client_id": self.access_id,
+            "access_token": token,
+            "t": t,
+            "sign_method": "HMAC-SHA256",
+            "sign": sign,
+            "Content-Type": "application/json"
+        }
+
+        try:
+            resp = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=3)
+            return bool(resp.json().get("success"))
+        except Exception:
+            return False
+
 
 class TuyaBulbSync:
     """
@@ -630,6 +681,7 @@ class TuyaBulbSync:
         self.protocol_version = float(self.config.get("protocol_version", 3.5))
 
         self.enabled = bool(self.config.get("enabled", True) and self.device_id)
+        self.power_on = bool(self.config.get("power_on", True))
         self.brightness = max(10, min(100, int(self.config.get("brightness", 70))))
         self.min_brightness = max(10, int(self.config.get("min_brightness", 10)))
         self.max_brightness = min(100, int(self.config.get("max_brightness", 100)))
@@ -734,6 +786,7 @@ class TuyaBulbSync:
             "dynamic_brightness": True,
             "phone_flash_enabled": True,
             "use_ethernet_only": True,
+            "power_on": True,
             "white_mode": False,
             "white_temp": 500,
             "saturation_boost": 1.8,
@@ -790,6 +843,18 @@ class TuyaBulbSync:
         if self.local_device:
             self.local_device.set_bind_ip(bind_ip)
             self.local_device.connect()
+
+    def set_power(self, enable: bool):
+        with self.lock:
+            self.power_on = bool(enable)
+            self.config["power_on"] = self.power_on
+            self.last_sent_white = -1
+            self.last_sent_hsv = (-1, -1, -1)
+        self.save_config()
+        if self.local_device:
+            self.local_device.set_power(self.power_on)
+        elif self.cloud_client:
+            self.cloud_client.set_power(self.power_on)
 
     def set_white_mode(self, enable: bool):
         with self.lock:
@@ -874,6 +939,7 @@ class TuyaBulbSync:
                 continue
 
             with self.lock:
+                power = self.power_on
                 w_mode = self.white_mode
                 bright_pct = self.brightness
                 min_b = self.min_brightness
@@ -888,6 +954,9 @@ class TuyaBulbSync:
                 tbloom = self.target_bloom
                 tblack = self.target_black
                 w_temp = self.white_temp
+
+            if not power:
+                continue
 
             # If Bulb is in Normal White Mode:
             if w_mode:
@@ -1025,6 +1094,8 @@ class TuyaBulbSync:
             self.local_device.close()
 
     def mode_short(self) -> str:
+        if not self.power_on:
+            return "Off"
         base = "Local" if self.mode == "Local Wi-Fi" else "Cloud"
         if self.white_mode:
             return f"{base} White"
@@ -1049,8 +1120,12 @@ class TuyaBulbSync:
                         flash = sync_self.phone_flash_enabled
                         white = sync_self.white_mode
                         eth = sync_self.use_ethernet_only
+                        power = sync_self.power_on
                         mode_str = sync_self.mode
-                        if white:
+                        if not power:
+                            r_d, g_d, b_d = 40, 40, 40
+                            display_mode = f"{mode_str} (Off)"
+                        elif white:
                             r_d, g_d, b_d = 255, 255, 255
                             display_mode = f"{mode_str} (White)"
                         else:
@@ -1063,6 +1138,7 @@ class TuyaBulbSync:
                     flash_checked = "checked" if flash else ""
                     white_checked = "checked" if white else ""
                     eth_checked = "checked" if eth else ""
+                    power_checked = "checked" if power else ""
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1150,6 +1226,10 @@ class TuyaBulbSync:
         <div class="sub">Bulb Brightness</div>
         <div class="val" id="val">{b}%</div>
         <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
+        <div class="toggle-box" style="border: 1px solid rgba(255, 179, 0, 0.25); background: rgba(255, 179, 0, 0.05);">
+            <span style="font-weight: 600; color: #ffb300;">💡 Bulb Power</span>
+            <input type="checkbox" id="power-toggle" {power_checked} onchange="togglePower(this.checked)">
+        </div>
         <div class="toggle-box">
             <span>Ethernet Only (Isolate Hotspot)</span>
             <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
@@ -1172,6 +1252,9 @@ class TuyaBulbSync:
         function update(v) {{
             document.getElementById('val').innerText = v + '%';
             fetch('/brightness?val=' + v);
+        }}
+        function togglePower(checked) {{
+            fetch('/power_toggle?val=' + (checked ? '1' : '0'));
         }}
         function toggleEth(checked) {{
             fetch('/ethernet_toggle?val=' + (checked ? '1' : '0'));
@@ -1210,6 +1293,15 @@ class TuyaBulbSync:
                             sync_self.set_brightness(int(qs["val"][0]))
                         except Exception:
                             pass
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
+                elif parsed.path == "/power_toggle":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_power(qs["val"][0] == "1")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
@@ -1259,8 +1351,12 @@ class TuyaBulbSync:
                         white = sync_self.white_mode
                         eth = sync_self.use_ethernet_only
                         eth_ip = sync_self.ethernet_ip
+                        power = sync_self.power_on
                         mode_str = sync_self.mode
-                        if white:
+                        if not power:
+                            r_d, g_d, b_d = 40, 40, 40
+                            display_mode = f"{mode_str} (Off)"
+                        elif white:
                             r_d, g_d, b_d = 255, 255, 255
                             display_mode = f"{mode_str} (White)"
                         else:
@@ -1279,6 +1375,7 @@ class TuyaBulbSync:
                         "white_mode": white,
                         "ethernet_only": eth,
                         "ethernet_ip": eth_ip,
+                        "power": power,
                         "mode": display_mode,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
