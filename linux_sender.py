@@ -274,6 +274,31 @@ class TuyaLocalDevice:
                 self.bulb = None
                 return False
 
+    def send_white(self, brightness: int, temp: int = 500) -> bool:
+        """Sets bulb to normal white mode with specified brightness (10-1000) and temp (0-1000)."""
+        if not self.is_connected or not self.bulb:
+            if not self.connect():
+                return False
+
+        with self.lock:
+            try:
+                self.bulb.set_multiple_values({
+                    '20': True,
+                    '21': 'white',
+                    '22': int(brightness),
+                    '23': int(temp)
+                }, nowait=True)
+                return True
+            except Exception:
+                self.is_connected = False
+                try:
+                    if self.bulb:
+                        self.bulb.close()
+                except Exception:
+                    pass
+                self.bulb = None
+                return False
+
     def close(self):
         with self.lock:
             if self.bulb:
@@ -401,6 +426,43 @@ class TuyaCloudClient:
         except Exception:
             return False
 
+    def send_white(self, brightness: int) -> bool:
+        """Sets bulb to normal white mode via Tuya Cloud OpenAPI."""
+        try:
+            token = self.get_token()
+        except Exception:
+            return False
+
+        now = time.time()
+        t = str(int(now * 1000))
+        commands = [
+            {"code": "switch_led", "value": True},
+            {"code": "work_mode", "value": "white"},
+            {"code": "bright_value_v2", "value": int(brightness)}
+        ]
+        payload = {"commands": commands}
+        body_str = json.dumps(payload, separators=(',', ':'))
+        body_hash = hashlib.sha256(body_str.encode('utf-8')).hexdigest()
+
+        path = f"/v1.0/iot-03/devices/{self.device_id}/commands"
+        string_to_sign = f"{self.access_id}{token}{t}POST\n{body_hash}\n\n{path}"
+        sign = self._calc_sign(string_to_sign)
+
+        headers = {
+            "client_id": self.access_id,
+            "access_token": token,
+            "t": t,
+            "sign_method": "HMAC-SHA256",
+            "sign": sign,
+            "Content-Type": "application/json"
+        }
+
+        try:
+            resp = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=3)
+            return bool(resp.json().get("success"))
+        except Exception:
+            return False
+
 
 class TuyaBulbSync:
     """
@@ -465,15 +527,21 @@ class TuyaBulbSync:
         self.cloud_refresh = float(self.config.get("refresh_interval_sec", 0.50))
         self.web_port = int(self.config.get("web_slider_port", 5556))
 
-        # Target color from screen frame
-        self.target_h = 0.0      # [0.0 .. 1.0]
-        self.target_s = 0.0      # [0.0 .. 1.0]
-        self.target_lum = 0.5    # [0.0 .. 1.0]
+        self.white_mode = bool(self.config.get("white_mode", False))
+        self.white_temp = int(self.config.get("white_temp", 500))
+        self.last_sent_white = -1
 
-        # Current smoothed color state
-        self.curr_h = 0.0        # [0.0 .. 360.0]
-        self.curr_s = 0.0        # [0.0 .. 1000.0]
-        self.curr_v = float(self.brightness * 10)  # [300.0 .. 1000.0]
+        # Target color from screen frame in RGB space [0.0 .. 1.0]
+        self.target_r = 1.0
+        self.target_g = 0.85
+        self.target_b = 0.70
+        self.target_lum = 0.5
+
+        # Current smoothed color state in RGB space
+        self.curr_r = 1.0
+        self.curr_g = 0.85
+        self.curr_b = 0.70
+        self.curr_lum = 0.5
         self.last_sent_hsv = (-1, -1, -1)
         self.current_display_b = self.brightness
 
@@ -543,6 +611,8 @@ class TuyaBulbSync:
             "max_brightness": 100,
             "dynamic_brightness": True,
             "phone_flash_enabled": True,
+            "white_mode": False,
+            "white_temp": 500,
             "saturation_boost": 1.8,
             "smoothing_alpha": 0.50,
             "local_refresh_hz": 20,
@@ -587,12 +657,27 @@ class TuyaBulbSync:
             self.config["phone_flash_enabled"] = self.phone_flash_enabled
         self.save_config()
 
+    def set_white_mode(self, enable: bool):
+        with self.lock:
+            self.white_mode = bool(enable)
+            self.config["white_mode"] = self.white_mode
+            self.last_sent_white = -1
+            self.last_sent_hsv = (-1, -1, -1)
+        self.save_config()
+        if self.white_mode:
+            b_val = int(self.brightness * 10)
+            if self.local_device:
+                self.local_device.send_white(b_val, self.white_temp)
+            elif self.cloud_client:
+                self.cloud_client.send_white(b_val)
+
     def update_frame(self, arr: np.ndarray):
         """
-        Extracts dominant color and screen luminance for dynamic lighting.
-        Reuses pre-allocated float32 buffers for zero heap allocation and minimal CPU.
+        Extracts dominant color in RGB space and screen luminance for dynamic lighting.
+        Linear RGB cross-fading smoothly transitions the two colors directly without
+        cycling through intermediate rainbow hues.
         """
-        if not self.enabled:
+        if not self.enabled or self.white_mode:
             return
 
         try:
@@ -607,18 +692,8 @@ class TuyaBulbSync:
             delta = cmax - cmin
 
             sat = np.zeros_like(cmax)
-            mask = cmax > 0.001
-            sat[mask] = delta[mask] / cmax[mask]
-
-            hue = np.zeros_like(cmax)
-            mask_r = (cmax == r) & (delta > 0.0001)
-            mask_g = (cmax == g) & (delta > 0.0001)
-            mask_b = (cmax == b) & (delta > 0.0001)
-
-            hue[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6.0
-            hue[mask_g] = ((b[mask_g] - r[mask_g]) / delta[mask_g]) + 2.0
-            hue[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4.0
-            hue = hue / 6.0
+            mask_nz = cmax > 0.001
+            sat[mask_nz] = delta[mask_nz] / cmax[mask_nz]
 
             # Perceived screen luminance for dynamic brightness
             luminance = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
@@ -626,7 +701,7 @@ class TuyaBulbSync:
             # Peak saturation on screen
             max_s = float(np.max(sat))
 
-            # Weight pixels by sat^3 * cmax + 0.005 so colored pixels strongly overpower background
+            # Weight pixels by sat^3 * cmax + 0.005 so colored pixels overpower background
             weights = (sat ** 3) * cmax + 0.005
             w_sum = weights.sum()
             if w_sum > 0:
@@ -634,36 +709,50 @@ class TuyaBulbSync:
             else:
                 weights = np.full_like(weights, 1.0 / weights.size)
 
-            # Circular weighted mean for Hue
-            angles = hue * 2.0 * np.pi
-            x = np.sum(weights * np.cos(angles))
-            y = np.sum(weights * np.sin(angles))
-            raw_h = float((np.arctan2(y, x) / (2.0 * np.pi)) % 1.0)
-            weighted_s = float(np.sum(weights * sat))
+            wr = float(np.sum(weights * r))
+            wg = float(np.sum(weights * g))
+            wb = float(np.sum(weights * b))
 
-            # High Saturation Mapping:
-            # If ANY color is present on screen (max_s >= 0.05 or weighted_s >= 0.03):
-            # Drive saturation up into the rich, vivid range (0.85 .. 1.00 / 850 .. 1000 in Tuya)!
-            if max_s >= 0.05 or weighted_s >= 0.03:
-                sat_scale = min(1.0, max(0.0, (max(max_s, weighted_s) - 0.04) / 0.30))
-                final_s = 0.85 + 0.15 * sat_scale  # 85% to 100% saturation!
-                final_h = raw_h
+            w_max = max(wr, wg, wb)
+            w_min = min(wr, wg, wb)
+            w_delta = w_max - w_min
+
+            # If color is present on screen (max_s >= 0.05 or weighted saturation >= 0.03):
+            # Scale to vibrant saturated color (85%-100% saturation)
+            if max_s >= 0.05 or (w_max > 1e-4 and (w_delta / w_max) >= 0.03):
+                if w_max > 1e-5:
+                    tr = wr / w_max
+                    tg = wg / w_max
+                    tb = wb / w_max
+                else:
+                    tr, tg, tb = 1.0, 0.85, 0.70
+
+                t_min = min(tr, tg, tb)
+                if t_min > 0:
+                    tr = max(0.0, tr - t_min * 0.85)
+                    tg = max(0.0, tg - t_min * 0.85)
+                    tb = max(0.0, tb - t_min * 0.85)
+                    norm = max(tr, tg, tb)
+                    if norm > 1e-5:
+                        tr /= norm
+                        tg /= norm
+                        tb /= norm
             else:
-                # Truly monochrome / pure black & white text: soft warm incandescent white
-                final_h = 32.0 / 360.0
-                final_s = 0.10
+                # Truly monochrome / text / dark: soft warm incandescent white
+                tr, tg, tb = 1.0, 0.85, 0.70
 
             with self.lock:
-                self.target_h = final_h
-                self.target_s = final_s
+                self.target_r = tr
+                self.target_g = tg
+                self.target_b = tb
                 self.target_lum = luminance
         except Exception:
             pass
 
     def _gradient_sync_loop(self):
         """
-        Runs smooth gradient interpolation towards target HSV and streams to the bulb
-        over persistent TCP socket (or rate-limited Cloud fallback).
+        Runs smooth direct color cross-fade in RGB space towards target frame
+        and streams to the bulb over persistent TCP socket (or rate-limited Cloud fallback).
         """
         time.sleep(0.5)
         while self.running:
@@ -675,42 +764,77 @@ class TuyaBulbSync:
                 continue
 
             with self.lock:
-                th = self.target_h
-                ts = self.target_s
-                tlum = self.target_lum
+                w_mode = self.white_mode
                 bright_pct = self.brightness
-                alpha = self.alpha
-                dyn = self.dynamic_brightness
                 min_b = self.min_brightness
                 max_b = self.max_brightness
+                dyn = self.dynamic_brightness
+                alpha = self.alpha
+                tr = self.target_r
+                tg = self.target_g
+                tb = self.target_b
+                tlum = self.target_lum
+                w_temp = self.white_temp
 
-            # 1. Compute dynamic brightness target:
-            # Uses a perceptual gamma curve (gamma 1.8) for dramatic dark-to-white contrast:
-            # - More black on screen: luminance drops near 0 -> bulb dims all the way down to min_brightness (30%)
-            # - More white on screen: luminance approaches 1.0 -> bulb scales up to full slider brightness (up to 100%)
+            # If Bulb is in Normal White Mode:
+            if w_mode:
+                b_val = int(bright_pct * 10)
+                if b_val != self.last_sent_white:
+                    sent = False
+                    if self.local_device:
+                        sent = self.local_device.send_white(b_val, w_temp)
+                        if sent:
+                            self.mode = "Local Wi-Fi"
+                    if not sent and self.cloud_client:
+                        sent = self.cloud_client.send_white(b_val)
+                        if sent:
+                            self.mode = "Cloud OpenAPI"
+                    if sent:
+                        self.last_sent_white = b_val
+                continue
+
+            # Display Sync Mode (RGB linear cross-fade):
+            # 1. Smooth RGB channels directly
+            self.curr_r += alpha * (tr - self.curr_r)
+            self.curr_g += alpha * (tg - self.curr_g)
+            self.curr_b += alpha * (tb - self.curr_b)
+            self.curr_lum += alpha * (tlum - self.curr_lum)
+
+            # 2. Dynamic brightness target:
             if dyn:
-                lum_factor = max(0.0, min(1.0, tlum)) ** 1.8
+                lum_factor = max(0.0, min(1.0, self.curr_lum)) ** 1.8
                 eff_brightness = min_b + (bright_pct - min_b) * lum_factor
                 target_v = max(float(min_b), min(float(max_b), eff_brightness))
             else:
                 target_v = float(bright_pct)
 
-            # 2. Smooth gradient interpolation (circular shortest-path for Hue)
-            target_h_deg = th * 360.0
-            diff_h = (target_h_deg - self.curr_h + 180.0) % 360.0 - 180.0
-            self.curr_h = (self.curr_h + alpha * diff_h) % 360.0
+            # 3. Convert smoothed RGB to Tuya HSV
+            cr, cg, cb = self.curr_r, self.curr_g, self.curr_b
+            cmax = max(cr, cg, cb)
+            cmin = min(cr, cg, cb)
+            delta = cmax - cmin
 
-            # Linear smoothing for Saturation & Value
-            target_s_tuya = ts * 1000.0
-            self.curr_s += alpha * (target_s_tuya - self.curr_s)
+            if delta < 1e-4 or cmax < 1e-4:
+                h_tuya = 32
+                s_tuya = 100
+            else:
+                if cmax == cr:
+                    h = ((cg - cb) / delta) % 6.0
+                elif cmax == cg:
+                    h = ((cb - cr) / delta) + 2.0
+                else:
+                    h = ((cr - cg) / delta) + 4.0
+                h_tuya = int((h * 60.0) % 360.0)
 
-            target_v_tuya = target_v * 10.0
-            self.curr_v += alpha * (target_v_tuya - self.curr_v)
+                s_raw = delta / cmax
+                if s_raw < 0.08:
+                    s_tuya = 100
+                    h_tuya = 32
+                else:
+                    progress = min(1.0, (s_raw - 0.08) / 0.35)
+                    s_tuya = int(850 + 150 * progress)
 
-            # 3. Format Tuya HSV (V clamped to min 10% = 100)
-            h_tuya = int(self.curr_h) % 360
-            s_tuya = int(max(0, min(1000, self.curr_s)))
-            v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
+            v_tuya = int(max(min_b * 10, min(1000, target_v * 10)))
             self.current_display_b = int(v_tuya / 10)
 
             # 4. Deadband check: send if changed
@@ -731,6 +855,7 @@ class TuyaBulbSync:
 
                 if sent:
                     self.last_sent_hsv = (h_tuya, s_tuya, v_tuya)
+                    self.last_sent_white = -1
 
     def start(self):
         if not self.enabled:
@@ -762,7 +887,10 @@ class TuyaBulbSync:
             self.local_device.close()
 
     def mode_short(self) -> str:
-        return "Local" if self.mode == "Local Wi-Fi" else "Cloud"
+        base = "Local" if self.mode == "Local Wi-Fi" else "Cloud"
+        if self.white_mode:
+            return f"{base} White"
+        return base
 
     def current_brightness_display(self) -> int:
         return self.current_display_b
@@ -781,15 +909,20 @@ class TuyaBulbSync:
                         b = sync_self.brightness
                         dyn = sync_self.dynamic_brightness
                         flash = sync_self.phone_flash_enabled
+                        white = sync_self.white_mode
                         mode_str = sync_self.mode
-                        h_norm = (sync_self.curr_h % 360.0) / 360.0
-                        s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
-                        v_norm = max(0.0, min(1.0, sync_self.curr_v / 1000.0))
-                        r_f, g_f, b_f = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
-                        r_d, g_d, b_d = int(r_f * 255), int(g_f * 255), int(b_f * 255)
+                        if white:
+                            r_d, g_d, b_d = 255, 255, 255
+                            display_mode = f"{mode_str} (White)"
+                        else:
+                            r_d = int(max(0.0, min(1.0, sync_self.curr_r)) * 255)
+                            g_d = int(max(0.0, min(1.0, sync_self.curr_g)) * 255)
+                            b_d = int(max(0.0, min(1.0, sync_self.curr_b)) * 255)
+                            display_mode = mode_str
 
                     dyn_checked = "checked" if dyn else ""
                     flash_checked = "checked" if flash else ""
+                    white_checked = "checked" if white else ""
                     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -872,11 +1005,15 @@ class TuyaBulbSync:
 <body>
     <div class="card">
         <h2>💡 Ambient Sync Control</h2>
-        <div class="badge" id="mode-badge">{mode_str}</div>
+        <div class="badge" id="mode-badge">{display_mode}</div>
         <div class="swatch" id="swatch"></div>
         <div class="sub">Bulb Brightness</div>
         <div class="val" id="val">{b}%</div>
         <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
+        <div class="toggle-box">
+            <span>Normal White Mode</span>
+            <input type="checkbox" id="white-toggle" {white_checked} onchange="toggleWhite(this.checked)">
+        </div>
         <div class="toggle-box">
             <span>Dynamic Bulb Shifts</span>
             <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
@@ -891,6 +1028,9 @@ class TuyaBulbSync:
         function update(v) {{
             document.getElementById('val').innerText = v + '%';
             fetch('/brightness?val=' + v);
+        }}
+        function toggleWhite(checked) {{
+            fetch('/white_mode?val=' + (checked ? '1' : '0'));
         }}
         function toggleDyn(checked) {{
             fetch('/dynamic?val=' + (checked ? '1' : '0'));
@@ -926,6 +1066,15 @@ class TuyaBulbSync:
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok"}')
 
+                elif parsed.path == "/white_mode":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_white_mode(qs["val"][0] == "1")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
                 elif parsed.path == "/dynamic":
                     qs = parse_qs(parsed.query)
                     if "val" in qs:
@@ -949,12 +1098,16 @@ class TuyaBulbSync:
                         b = sync_self.brightness
                         dyn = sync_self.dynamic_brightness
                         flash = sync_self.phone_flash_enabled
+                        white = sync_self.white_mode
                         mode_str = sync_self.mode
-                        h_norm = (sync_self.curr_h % 360.0) / 360.0
-                        s_norm = max(0.0, min(1.0, sync_self.curr_s / 1000.0))
-                        v_norm = max(0.0, min(1.0, sync_self.curr_v / 1000.0))
-                        r_f, g_f, b_f = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
-                        r_d, g_d, b_d = int(r_f * 255), int(g_f * 255), int(b_f * 255)
+                        if white:
+                            r_d, g_d, b_d = 255, 255, 255
+                            display_mode = f"{mode_str} (White)"
+                        else:
+                            r_d = int(max(0.0, min(1.0, sync_self.curr_r)) * 255)
+                            g_d = int(max(0.0, min(1.0, sync_self.curr_g)) * 255)
+                            b_d = int(max(0.0, min(1.0, sync_self.curr_b)) * 255)
+                            display_mode = mode_str
 
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -963,7 +1116,8 @@ class TuyaBulbSync:
                         "brightness": b,
                         "dynamic": dyn,
                         "phone_flash": flash,
-                        "mode": mode_str,
+                        "white_mode": white,
+                        "mode": display_mode,
                         "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
                 else:
