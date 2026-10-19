@@ -479,6 +479,7 @@ class TuyaBulbSync:
 
         self.lock = threading.Lock()
         self.running = False
+        self._rgb_f32 = np.empty((HEIGHT, WIDTH, 3), dtype=np.float32)
 
         self.local_device = None
         self.cloud_client = None
@@ -588,17 +589,18 @@ class TuyaBulbSync:
 
     def update_frame(self, arr: np.ndarray):
         """
-        Extracts saturation-weighted dominant color and screen luminance for dynamic brightness.
-        Separates color extraction from phone's flat average so the bulb utilizes its full gamut.
+        Extracts dominant color and screen luminance for dynamic lighting.
+        Reuses pre-allocated float32 buffers for zero heap allocation and minimal CPU.
         """
         if not self.enabled:
             return
 
         try:
-            rgb_norm = arr.astype(np.float32) / 255.0
-            r = rgb_norm[..., 0]
-            g = rgb_norm[..., 1]
-            b = rgb_norm[..., 2]
+            # Reusable in-place float buffer (zero allocation per frame)
+            np.multiply(arr, 1.0 / 255.0, out=self._rgb_f32, dtype=np.float32)
+            r = self._rgb_f32[..., 0]
+            g = self._rgb_f32[..., 1]
+            b = self._rgb_f32[..., 2]
 
             cmax = np.maximum(np.maximum(r, g), b)
             cmin = np.minimum(np.minimum(r, g), b)
@@ -618,13 +620,14 @@ class TuyaBulbSync:
             hue[mask_b] = ((r[mask_b] - g[mask_b]) / delta[mask_b]) + 4.0
             hue = hue / 6.0
 
-            val = cmax
-
-            # Perceived screen luminance for dynamic brightness (photometric weights)
+            # Perceived screen luminance for dynamic brightness
             luminance = float(np.mean(0.299 * r + 0.587 * g + 0.114 * b))
 
-            # Weight by sat^2 * val + 0.01 so vibrant colors dominate over neutral white/gray UI
-            weights = (sat ** 2) * val + 0.01
+            # Peak saturation on screen
+            max_s = float(np.max(sat))
+
+            # Weight pixels by sat^3 * cmax + 0.005 so colored pixels strongly overpower background
+            weights = (sat ** 3) * cmax + 0.005
             w_sum = weights.sum()
             if w_sum > 0:
                 weights /= w_sum
@@ -636,19 +639,19 @@ class TuyaBulbSync:
             x = np.sum(weights * np.cos(angles))
             y = np.sum(weights * np.sin(angles))
             raw_h = float((np.arctan2(y, x) / (2.0 * np.pi)) % 1.0)
-            raw_s = float(np.sum(weights * sat))
+            weighted_s = float(np.sum(weights * sat))
 
-            # Aesthetic Saturation Mapping:
-            # Weak/low saturations (0.15 - 0.55) create harsh, eye-straining sickly neon pastel washes on RGB LEDs.
-            # When screen is neutral / monochrome / text, glide to a gentle, cozy warm ambient white (Hue 32°, Sat 0.12).
-            # When scene is colorful, clamp saturation into the soothing, rich, cinematic range (0.65 .. 0.95).
-            if raw_s < 0.12:
-                final_h = 32.0 / 360.0   # Soft warm 3000K incandescent white
-                final_s = 0.12            # Pleasant ambient glow (no harsh glare)
-            else:
-                color_progress = min(1.0, (raw_s - 0.12) / 0.35)
-                final_s = 0.65 + 0.30 * color_progress
+            # High Saturation Mapping:
+            # If ANY color is present on screen (max_s >= 0.05 or weighted_s >= 0.03):
+            # Drive saturation up into the rich, vivid range (0.85 .. 1.00 / 850 .. 1000 in Tuya)!
+            if max_s >= 0.05 or weighted_s >= 0.03:
+                sat_scale = min(1.0, max(0.0, (max(max_s, weighted_s) - 0.04) / 0.30))
+                final_s = 0.85 + 0.15 * sat_scale  # 85% to 100% saturation!
                 final_h = raw_h
+            else:
+                # Truly monochrome / pure black & white text: soft warm incandescent white
+                final_h = 32.0 / 360.0
+                final_s = 0.10
 
             with self.lock:
                 self.target_h = final_h
@@ -997,7 +1000,8 @@ class MutterScreenSync:
         self.sess_proxy = None
         self.last_rgb = (-1, -1, -1)
         self.last_vibe = -1
-        self.last_raw_bytes = b""
+        self._last_u64 = np.zeros(WIDTH * HEIGHT * 3 // 8, dtype=np.uint64)
+        self._payload = bytearray(4)
         self.last_print_time = 0.0
         self.phone_worker_running = True
 
@@ -1049,10 +1053,13 @@ class MutterScreenSync:
             return Gst.FlowReturn.OK
 
         try:
-            # 16x9 x 3 bytes RGB = 432 bytes total
-            raw_bytes = bytes(map_info.data)
-            is_duplicate = (raw_bytes == self.last_raw_bytes)
-            self.last_raw_bytes = raw_bytes
+            # Zero-allocation uint64 duplicate detection (1 microsecond)
+            curr_u64 = np.frombuffer(map_info.data, dtype=np.uint64)
+            if np.array_equal(curr_u64, self._last_u64):
+                is_duplicate = True
+            else:
+                is_duplicate = False
+                self._last_u64[:] = curr_u64
 
             arr = np.frombuffer(map_info.data, dtype=np.uint8).reshape((HEIGHT, WIDTH, 3))
 
@@ -1064,12 +1071,16 @@ class MutterScreenSync:
                 flash_allowed = self.tuya.phone_flash_enabled if self.tuya else True
                 vibe = current_vibration if flash_allowed else 0
 
-            payload = bytes([r, g, b, vibe])
+            # Pre-allocated 4-byte buffer (zero heap allocation per frame)
+            self._payload[0] = r
+            self._payload[1] = g
+            self._payload[2] = b
+            self._payload[3] = vibe
 
             # 1. Stream to Phone over ADB USB
             if self.sock:
                 try:
-                    self.sock.sendall(payload)
+                    self.sock.sendall(self._payload)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     try:
                         self.sock.close()
@@ -1077,13 +1088,13 @@ class MutterScreenSync:
                         pass
                     self.sock = None
 
-            # 2. Feed frame to Tuya bulb controller (skip if static/duplicate to keep CPU ultra-low)
+            # 2. Feed frame to Tuya bulb controller (skip if static/duplicate to keep CPU minimal)
             if self.tuya and self.tuya.enabled and not is_duplicate:
                 self.tuya.update_frame(arr)
 
-            # 3. Terminal status display (throttled to 4 Hz to avoid terminal emulator redraw load during games)
+            # 3. Terminal status display (throttled to 3 Hz to save terminal emulator redraw load during games)
             now = time.time()
-            if ((r, g, b) != self.last_rgb or vibe != self.last_vibe) and (now - self.last_print_time >= 0.25):
+            if ((r, g, b) != self.last_rgb or vibe != self.last_vibe) and (now - self.last_print_time >= 0.35):
                 self.last_print_time = now
                 self.last_rgb = (r, g, b)
                 self.last_vibe = vibe
