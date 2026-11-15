@@ -110,10 +110,10 @@ def unlock_and_launch_phone():
     """Wakes the phone, dismisses keyguard, and launches the app in fullscreen mode."""
     try:
         # 1. Wake screen if asleep (KEYCODE_WAKEUP = 224)
-        subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         # 2. Dismiss keyguard cleanly via KEYCODE_MENU (82)
-        subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["adb", "shell", "input", "keyevent", "82"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        subprocess.run(["adb", "shell", "input", "keyevent", "82"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         time.sleep(0.3)
         # 3. Launch the app in foreground with fullscreen intent extra
         subprocess.run([
@@ -123,9 +123,9 @@ def unlock_and_launch_phone():
             "-c", "android.intent.category.LAUNCHER",
             "-n", "com.flashlight.torch/.MainActivity",
             "--ez", "hide_controls", "true"
-        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3.0)
         # 4. Broadcast HIDE_UI to ensure fullscreen
-        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         print("[+] Phone wake & launch intent sent.")
     except Exception as e:
         print(f"[!] Notice: ADB unlock/launch skipped (phone not connected): {e}")
@@ -1293,11 +1293,19 @@ class TuyaBulbSync:
                     self.wfile.write(b'{"status":"ok"}')
 
                 elif parsed.path == "/reconnect":
+                    unlock_and_launch_phone()
                     ok = sync_self.force_reconnect()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(b'{"status":"ok"}' if ok else b'{"status":"failed"}')
+
+                elif parsed.path in ("/wake_phone", "/reconnect_phone"):
+                    unlock_and_launch_phone()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
 
                 elif parsed.path == "/power_toggle":
                     qs = parse_qs(parsed.query)
@@ -1451,21 +1459,32 @@ class MutterScreenSync:
     def _phone_connect_worker(self):
         """Asynchronously connects to the phone in the background without blocking screen capture or Tuya sync."""
         time.sleep(0.5)
+        last_wake_attempt = 0.0
         while self.phone_worker_running:
             if self.sock is not None:
                 time.sleep(1.0)
                 continue
 
             try:
+                # If an ADB device is connected and authorized, wake it and launch the torch app
+                if check_adb_device():
+                    now = time.time()
+                    if now - last_wake_attempt >= 5.0:
+                        last_wake_attempt = now
+                        unlock_and_launch_phone()
+                        time.sleep(0.3)
+
                 setup_adb_forward(self.port)
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(2.0)
                 s.connect((HOST, self.port))
+                s.settimeout(None)
                 self.sock = s
                 print("\n[+] Connected to Android phone app!")
                 if self.auto_dismiss_ui:
                     dismiss_initial_ui()
-            except (ConnectionRefusedError, OSError):
+            except (ConnectionRefusedError, socket.timeout, OSError):
                 time.sleep(2.0)
 
     def on_new_sample(self, appsink):
@@ -1518,9 +1537,9 @@ class MutterScreenSync:
             if self.tuya and self.tuya.enabled and not is_duplicate:
                 self.tuya.update_frame(arr)
 
-            # 3. Terminal status display (throttled to 3 Hz to save terminal emulator redraw load during games)
+            # 3. Terminal status display (only when attached to an interactive terminal)
             now = time.time()
-            if ((r, g, b) != self.last_rgb or vibe != self.last_vibe) and (now - self.last_print_time >= 0.35):
+            if sys.stdout.isatty() and ((r, g, b) != self.last_rgb or vibe != self.last_vibe) and (now - self.last_print_time >= 0.35):
                 self.last_print_time = now
                 self.last_rgb = (r, g, b)
                 self.last_vibe = vibe

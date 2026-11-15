@@ -300,8 +300,8 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._powerSwitch);
 
-        // 4. Reconnect Bulb Button (Adwaita symbolic icon, clean text, no emojis)
-        this._reconnectBtn = new PopupMenu.PopupImageMenuItem('Reconnect Bulb', 'view-refresh-symbolic');
+        // 4. Reconnect Devices Button (Adwaita symbolic icon, clean text, no emojis)
+        this._reconnectBtn = new PopupMenu.PopupImageMenuItem('Reconnect Bulb & Phone', 'view-refresh-symbolic');
         this._reconnectBtn.connect('activate', async () => {
             this._reconnectBtn.label.text = 'Connecting...';
             const res = await this._sendApiRequest('/reconnect');
@@ -311,7 +311,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
                 this._reconnectBtn.label.text = 'Connection Failed';
             }
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-                this._reconnectBtn.label.text = 'Reconnect Bulb';
+                this._reconnectBtn.label.text = 'Reconnect Bulb & Phone';
                 return GLib.SOURCE_REMOVE;
             });
             this._pollStatus();
@@ -440,7 +440,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         try {
             this._subprocess = new Gio.Subprocess({
                 argv: ['python3', scriptPath],
-                flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+                flags: Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_PIPE,
             });
             this._subprocess.init(this._cancellable);
 
