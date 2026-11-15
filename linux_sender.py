@@ -5,7 +5,7 @@ Mutter ScreenCast (PipeWire) Display Sync, Controller Rumble Interceptor & Tuya 
 - Captures desktop color downscaled to 16x9 at the source (Mutter GPU compositor pass).
 - Phone Sync (ADB USB tcp:5555): sub-5ms low-latency ambient color + camera torch flash on rumble.
 - Tuya Bulb Sync: Exponential smoothing (soft transitions), rate-limited at 2 Hz, 30-100% brightness.
-- Localhost JSON Control API: Lightweight control API at http://127.0.0.1:5556.
+- Web Brightness Slider: Live dark-mode slider at http://localhost:5556.
 - Fault-tolerant: Phone or Tuya bulb not being connected/configured never blocks or halts the pipeline.
 - Clean shutdown: On Ctrl-C or exit, closes app, sleeps phone, and shuts down pipeline.
 """
@@ -52,22 +52,7 @@ FPS_TARGET = 60
 WIDTH = 16
 HEIGHT = 9
 
-def resolve_config_path(explicit_path: str = None) -> str:
-    """Resolves tuya_config.json prioritizing ~/.config/display-sync so extension updates do not overwrite credentials."""
-    if explicit_path and os.path.isfile(explicit_path):
-        return explicit_path
-    user_cfg = os.path.expanduser("~/.config/display-sync/tuya_config.json")
-    if os.path.isfile(user_cfg):
-        return user_cfg
-    script_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuya_config.json")
-    if os.path.isfile(script_cfg):
-        return script_cfg
-    home_cfg = os.path.expanduser("~/tuya_config.json")
-    if os.path.isfile(home_cfg):
-        return home_cfg
-    return user_cfg
-
-CONFIG_FILE = resolve_config_path()
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuya_config.json")
 EMPTY_BODY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 TUYA_REGIONS = {
@@ -87,24 +72,6 @@ is_cleaning_up = False
 # ==============================================================================
 # Phone (ADB) Utilities
 # ==============================================================================
-
-_last_adb_check = 0.0
-_cached_adb_status = False
-
-def check_adb_device() -> bool:
-    """Checks if an authorized Android device is connected via ADB (cached for 2s to optimize polling)."""
-    global _last_adb_check, _cached_adb_status
-    now = time.time()
-    if now - _last_adb_check < 2.0:
-        return _cached_adb_status
-    _last_adb_check = now
-    try:
-        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
-        lines = [line.strip() for line in res.stdout.splitlines() if line.strip() and not line.startswith("List of")]
-        _cached_adb_status = any("\tdevice" in line for line in lines)
-    except Exception:
-        _cached_adb_status = False
-    return _cached_adb_status
 
 def unlock_and_launch_phone():
     """Wakes the phone, dismisses keyguard, and launches the app in fullscreen mode."""
@@ -148,16 +115,13 @@ def cleanup_phone_and_exit(sync_instance=None):
 
     print("\n[*] Shutting down: closing app and turning off phone screen...")
     try:
-        subprocess.run(["adb", "shell", "am", "force-stop", "com.flashlight.torch"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
-        subprocess.run(["adb", "shell", "input", "keyevent", "223"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        subprocess.run(["adb", "shell", "am", "force-stop", "com.flashlight.torch"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "input", "keyevent", "223"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
     if sync_instance:
-        try:
-            sync_instance.stop()
-        except Exception:
-            pass
+        sync_instance.stop()
 
 
 def setup_adb_forward(port: int):
@@ -700,13 +664,13 @@ class TuyaBulbSync:
     - Dynamic brightness shifts: bulb scales dynamically with screen luminance (clamped 30%-100%)
     - Smooth gradient easing: shortest circular path Hue and linear Saturation/Value interpolation
     - Fallback: Tuya Cloud OpenAPI if local network is unavailable
-    - JSON control API: real-time brightness and dynamic mode control at http://127.0.0.1:5556
+    - Web slider server: real-time brightness and dynamic mode control at http://localhost:5556
     """
-    def __init__(self, config_path: str = None, cli_brightness: int = None,
+    def __init__(self, config_path: str = CONFIG_FILE, cli_brightness: int = None,
                  cli_id: str = None, cli_secret: str = None, cli_device: str = None,
                  cli_region: str = None, cli_ip: str = None, cli_key: str = None,
                  cli_dynamic: bool = None, cli_hz: float = None):
-        self.config_path = resolve_config_path(config_path)
+        self.config_path = config_path
         self.config = self.load_config()
 
         changed = False
@@ -876,8 +840,6 @@ class TuyaBulbSync:
         if conf is None:
             conf = self.config
         try:
-            cfg_dir = os.path.dirname(os.path.abspath(self.config_path))
-            os.makedirs(cfg_dir, exist_ok=True)
             with open(self.config_path, "w") as f:
                 json.dump(conf, f, indent=2)
         except Exception:
@@ -1251,10 +1213,246 @@ class TuyaBulbSync:
             def do_GET(self):
                 parsed = urlparse(self.path)
                 if parsed.path == "/":
+                    with sync_self.lock:
+                        b = sync_self.brightness
+                        dyn = sync_self.dynamic_brightness
+                        flash = sync_self.phone_flash_enabled
+                        white = sync_self.white_mode
+                        eth = sync_self.use_ethernet_only
+                        power = sync_self.power_on
+                        cur_hz = sync_self.local_hz
+                        cur_alpha = sync_self.alpha
+                        mode_str = sync_self.mode
+                        if not power:
+                            r_d, g_d, b_d = 40, 40, 40
+                            display_mode = f"{mode_str} (Off)"
+                        elif white:
+                            r_d, g_d, b_d = 255, 255, 255
+                            display_mode = f"{mode_str} (White)"
+                        else:
+                            r_d = int(max(0.0, min(1.0, sync_self.curr_r)) * 255)
+                            g_d = int(max(0.0, min(1.0, sync_self.curr_g)) * 255)
+                            b_d = int(max(0.0, min(1.0, sync_self.curr_b)) * 255)
+                            display_mode = mode_str
+
+                    dyn_checked = "checked" if dyn else ""
+                    flash_checked = "checked" if flash else ""
+                    white_checked = "checked" if white else ""
+                    eth_checked = "checked" if eth else ""
+                    power_checked = "checked" if power else ""
+                    hz_options = [10, 12, 14, 15, 18, 20]
+                    hz_options_html = "".join([f'<option value="{opt}"{" selected" if int(round(cur_hz)) == opt else ""}>{opt} Hz</option>' for opt in hz_options])
+                    alpha_pct = int(round(cur_alpha * 100))
+                    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Display Sync Controls</title>
+    <style>
+        body {{
+            background: #111116;
+            color: #f0f0f5;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }}
+        .card {{
+            background: #1b1b24;
+            padding: 28px 24px;
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+            width: 330px;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.08);
+        }}
+        h2 {{ margin: 0 0 8px; font-size: 20px; }}
+        .badge {{
+            display: inline-block;
+            background: rgba(76, 175, 80, 0.2);
+            color: #4CAF50;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-bottom: 12px;
+        }}
+        .swatch {{
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            margin: 6px auto 12px;
+            border: 3px solid rgba(255,255,255,0.2);
+            transition: background 0.15s ease;
+            background: rgb({r_d},{g_d},{b_d});
+        }}
+        .val {{
+            font-size: 30px;
+            font-weight: bold;
+            color: #ffb300;
+            margin: 8px 0;
+            font-family: monospace;
+        }}
+        input[type=range] {{
+            width: 100%;
+            margin: 12px 0 8px;
+            accent-color: #ffb300;
+            height: 8px;
+            border-radius: 4px;
+            outline: none;
+        }}
+        .toggle-box {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(255,255,255,0.05);
+            padding: 9px 14px;
+            border-radius: 12px;
+            margin: 8px 0;
+            font-size: 13px;
+        }}
+        .btn-reconnect {{
+            width: 100%;
+            background: rgba(255, 179, 0, 0.12);
+            color: #ffb300;
+            border: 1px solid rgba(255, 179, 0, 0.35);
+            border-radius: 12px;
+            padding: 10px 14px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            margin: 8px 0;
+            transition: all 0.2s ease;
+        }}
+        .btn-reconnect:hover {{
+            background: rgba(255, 179, 0, 0.22);
+            border-color: #ffb300;
+        }}
+        .btn-reconnect:active {{
+            transform: scale(0.98);
+        }}
+        .sub {{
+            color: rgba(255,255,255,0.45);
+            font-size: 11px;
+            line-height: 1.4;
+            margin-top: 6px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>💡 Ambient Sync Control</h2>
+        <div class="badge" id="mode-badge">{display_mode}</div>
+        <div class="swatch" id="swatch"></div>
+        <div class="sub">Bulb Brightness</div>
+        <div class="val" id="val">{b}%</div>
+        <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
+        <div class="toggle-box" style="border: 1px solid rgba(255, 179, 0, 0.25); background: rgba(255, 179, 0, 0.05);">
+            <span style="font-weight: 600; color: #ffb300;">💡 Bulb Power</span>
+            <input type="checkbox" id="power-toggle" {power_checked} onchange="togglePower(this.checked)">
+        </div>
+        <button id="reconnect-btn" class="btn-reconnect" onclick="reconnectBulb()">🔄 Reconnect Bulb</button>
+        <div class="toggle-box">
+            <span>Refresh Rate</span>
+            <select id="hz-select" style="background:#282836; color:#ffb300; border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:3px 8px; font-weight:bold; outline:none; font-size:12px;" onchange="updateHz(this.value)">
+                {hz_options_html}
+            </select>
+        </div>
+        <div class="toggle-box">
+            <span>Responsiveness (Speed)</span>
+            <span id="alpha-val" style="font-weight:bold; color:#ffb300;">{alpha_pct}%</span>
+        </div>
+        <input type="range" min="30" max="95" value="{alpha_pct}" id="alpha-slider" oninput="updateAlpha(this.value)">
+        <div class="toggle-box">
+            <span>Ethernet Only (Isolate Hotspot)</span>
+            <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
+        </div>
+        <div class="toggle-box">
+            <span>Normal White Mode</span>
+            <input type="checkbox" id="white-toggle" {white_checked} onchange="toggleWhite(this.checked)">
+        </div>
+        <div class="toggle-box">
+            <span>Dynamic Bulb Shifts</span>
+            <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
+        </div>
+        <div class="toggle-box">
+            <span>Phone Torch on Rumble</span>
+            <input type="checkbox" id="flash-toggle" {flash_checked} onchange="toggleFlash(this.checked)">
+        </div>
+        <div class="sub">Min 10% clamp prevents cutoff & flicker</div>
+    </div>
+    <script>
+        function update(v) {{
+            document.getElementById('val').innerText = v + '%';
+            fetch('/brightness?val=' + v);
+        }}
+        function updateHz(v) {{
+            fetch('/refresh_hz?val=' + v);
+        }}
+        function updateAlpha(v) {{
+            document.getElementById('alpha-val').innerText = v + '%';
+            fetch('/smoothing?val=' + v);
+        }}
+        function reconnectBulb() {{
+            let btn = document.getElementById('reconnect-btn');
+            if (btn) btn.innerText = 'Connecting...';
+            fetch('/reconnect')
+                .then(r => r.json())
+                .then(d => {{
+                    if (btn) btn.innerText = d.status === 'ok' ? '✓ Connected' : '✕ Reconnect Failed';
+                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
+                    fetchStatus();
+                }})
+                .catch(() => {{
+                    if (btn) btn.innerText = '✕ Error';
+                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
+                }});
+        }}
+        function togglePower(checked) {{
+            fetch('/power_toggle?val=' + (checked ? '1' : '0'));
+        }}
+        function toggleEth(checked) {{
+            fetch('/ethernet_toggle?val=' + (checked ? '1' : '0'));
+        }}
+        function toggleWhite(checked) {{
+            fetch('/white_mode?val=' + (checked ? '1' : '0'));
+        }}
+        function toggleDyn(checked) {{
+            fetch('/dynamic?val=' + (checked ? '1' : '0'));
+        }}
+        function toggleFlash(checked) {{
+            fetch('/phone_flash?val=' + (checked ? '1' : '0'));
+        }}
+        async function fetchStatus() {{
+            if (document.hidden) return;
+            try {{
+                let r = await fetch('/status');
+                let d = await r.json();
+                document.getElementById('swatch').style.background = 'rgb(' + d.r + ',' + d.g + ',' + d.b + ')';
+                document.getElementById('mode-badge').innerText = d.mode;
+                let hzSelect = document.getElementById('hz-select');
+                if (hzSelect && document.activeElement !== hzSelect && d.refresh_hz) {{
+                    hzSelect.value = String(Math.round(d.refresh_hz));
+                }}
+                let aSlider = document.getElementById('alpha-slider');
+                if (aSlider && document.activeElement !== aSlider && d.smoothing_alpha) {{
+                    let pct = Math.round(d.smoothing_alpha * 100);
+                    aSlider.value = pct;
+                    document.getElementById('alpha-val').innerText = pct + '%';
+                }}
+            }} catch(e) {{}}
+        }}
+        setInterval(fetchStatus, 5000);
+    </script>
+</body>
+</html>"""
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
-                    self.wfile.write(b'{"service":"display-sync","status":"running"}')
+                    self.wfile.write(html.encode('utf-8'))
 
                 elif parsed.path == "/brightness":
                     qs = parse_qs(parsed.query)
@@ -1371,7 +1569,6 @@ class TuyaBulbSync:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    adb_connected = check_adb_device()
                     self.wfile.write(json.dumps({
                         "brightness": b,
                         "dynamic": dyn,
@@ -1383,24 +1580,19 @@ class TuyaBulbSync:
                         "refresh_hz": cur_hz,
                         "smoothing_alpha": cur_alpha,
                         "mode": display_mode,
-                        "r": r_d, "g": g_d, "b": b_d,
-                        "adb_connected": adb_connected,
-                        "adb_status": "Connected" if adb_connected else "Disconnected"
+                        "r": r_d, "g": g_d, "b": b_d
                     }).encode('utf-8'))
                 else:
                     self.send_response(404)
                     self.end_headers()
 
-        class ReusableHTTPServer(HTTPServer):
-            allow_reuse_address = True
-
         def run_server():
             try:
-                server = ReusableHTTPServer(("127.0.0.1", self.web_port), SliderHandler)
-                print(f"[+] Display Sync JSON Control API running at: http://127.0.0.1:{self.web_port}")
+                server = HTTPServer(("0.0.0.0", self.web_port), SliderHandler)
+                print(f"[+] Tuya Brightness Web Slider running at: http://localhost:{self.web_port}")
                 server.serve_forever()
             except Exception as e:
-                print(f"[!] Warning: Control API server failed on port {self.web_port}: {e}")
+                print(f"[!] Warning: Tuya Web Slider server failed on port {self.web_port}: {e}")
 
         threading.Thread(target=run_server, daemon=True).start()
 
@@ -1677,7 +1869,10 @@ def main():
 
     # 2. Signal handlers for clean exit on Ctrl-C or SIGTERM
     def sig_handler(*_):
-        cleanup_phone_and_exit(sync)
+        if not sync.skip_phone:
+            cleanup_phone_and_exit(sync)
+        else:
+            sync.stop()
         if sync.loop and sync.loop.is_running():
             sync.loop.quit()
         sys.exit(0)
@@ -1685,20 +1880,8 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
     try:
-        try:
-            from gi.repository import GLibUnix
-            signal_add_fn = GLibUnix.signal_add
-        except (ImportError, AttributeError):
-            signal_add_fn = GLib.unix_signal_add
-
-        def glib_sig():
-            cleanup_phone_and_exit(sync)
-            if sync.loop and sync.loop.is_running():
-                sync.loop.quit()
-            return GLib.SOURCE_REMOVE
-
-        signal_add_fn(GLib.PRIORITY_HIGH, signal.SIGINT, glib_sig)
-        signal_add_fn(GLib.PRIORITY_HIGH, signal.SIGTERM, glib_sig)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sig_handler)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sig_handler)
     except Exception:
         pass
     if not sync.skip_phone:
