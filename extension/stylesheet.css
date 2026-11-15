@@ -1,18 +1,9 @@
 /* Display Sync GNOME Shell Extension Styles */
 
-.ds-color-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 4px;
-    margin-left: 3px;
-    background-color: #555555;
-    border: 1px solid rgba(255, 255, 255, 0.4);
-    transition-duration: 200ms;
-}
-
 .ds-status-box {
-    padding: 6px 12px;
+    padding: 8px 12px;
     background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 8px;
     margin: 4px 6px;
 }
@@ -35,24 +26,46 @@
     line-height: 1.35;
 }
 
-.ds-slider-row {
-    padding: 2px 6px;
+/* Slider Row Layout & Styling */
+.ds-slider-item {
+    padding: 6px 12px;
+}
+
+.ds-slider-item:hover,
+.ds-slider-item:focus,
+.ds-slider-item:active {
+    background-color: transparent;
+}
+
+.ds-slider-container {
+    spacing: 6px;
+}
+
+.ds-slider-header {
     spacing: 8px;
 }
 
-.ds-slider-label {
-    min-width: 140px;
-    font-size: 12px;
+.ds-slider-left-box {
+    spacing: 8px;
+}
+
+.ds-slider-icon {
+    icon-size: 16px;
+}
+
+.ds-slider-title {
+    font-weight: 500;
 }
 
 .ds-slider-value {
+    font-weight: bold;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.85);
     min-width: 44px;
     text-align: right;
-    font-weight: bold;
-    font-family: monospace;
-    color: #ffb300;
 }
 
-.ds-icon {
-    icon-size: 16px;
+.ds-slider {
+    height: 18px;
+    min-width: 200px;
 }

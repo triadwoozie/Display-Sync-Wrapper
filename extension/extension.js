@@ -21,13 +21,18 @@ const POLL_INTERVAL_MS = 2000;
 const DEBOUNCE_DELAY_MS = 80;
 
 /**
- * Debounced Slider Menu Item with feedback-loop prevention.
+ * Debounced Slider Menu Item with full-width track and clean Adwaita header.
  * Clamps values between [minVal, maxVal] and avoids relayout when unchanged.
  */
 const DebouncedSliderMenuItem = GObject.registerClass(
 class DebouncedSliderMenuItem extends PopupMenu.PopupBaseMenuItem {
     _init(iconName, labelText, minVal, maxVal, initialVal, unit, onValueChanged) {
-        super._init({ activate: false, reactive: true });
+        super._init({
+            activate: false,
+            reactive: true,
+            hover: false,
+            style_class: 'popup-menu-item ds-slider-item',
+        });
 
         this._min = minVal;
         this._max = maxVal;
@@ -39,42 +44,62 @@ class DebouncedSliderMenuItem extends PopupMenu.PopupBaseMenuItem {
         this._pendingVal = null;
         this._currentVal = Math.round(initialVal);
 
-        const box = new St.BoxLayout({
-            style_class: 'ds-slider-row',
+        const container = new St.BoxLayout({
+            vertical: true,
+            x_expand: true,
+            style_class: 'ds-slider-container',
+        });
+
+        // 1. Header row: [Icon + Title] on left, [Percentage %] on right
+        const headerRow = new St.BoxLayout({
+            style_class: 'ds-slider-header',
             x_expand: true,
             y_align: Clutter.ActorAlign.CENTER,
+            reactive: false,
+        });
+
+        const leftBox = new St.BoxLayout({
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'ds-slider-left-box',
         });
 
         if (iconName) {
             const icon = new St.Icon({
                 icon_name: iconName,
-                style_class: 'ds-icon popup-menu-icon',
+                style_class: 'popup-menu-icon ds-slider-icon',
                 y_align: Clutter.ActorAlign.CENTER,
             });
-            box.add_child(icon);
+            leftBox.add_child(icon);
         }
 
         const label = new St.Label({
             text: labelText,
-            style_class: 'ds-slider-label popup-menu-label',
+            style_class: 'popup-menu-label ds-slider-title',
             y_align: Clutter.ActorAlign.CENTER,
         });
-        box.add_child(label);
-
-        const norm = (initialVal - this._min) / (this._max - this._min);
-        this._slider = new Slider.Slider(Math.max(0, Math.min(1, norm)));
-        this._slider.x_expand = true;
-        this._slider.y_align = Clutter.ActorAlign.CENTER;
-        box.add_child(this._slider);
+        leftBox.add_child(label);
+        headerRow.add_child(leftBox);
 
         this._valueLabel = new St.Label({
             text: `${this._currentVal}${this._unit}`,
             style_class: 'ds-slider-value',
+            x_align: Clutter.ActorAlign.END,
             y_align: Clutter.ActorAlign.CENTER,
         });
-        box.add_child(this._valueLabel);
+        headerRow.add_child(this._valueLabel);
+        container.add_child(headerRow);
 
-        this.add_child(box);
+        // 2. Full-width slider row below the header
+        const norm = (initialVal - this._min) / (this._max - this._min);
+        this._slider = new Slider.Slider(Math.max(0, Math.min(1, norm)));
+        this._slider.x_expand = true;
+        this._slider.x_align = Clutter.ActorAlign.FILL;
+        this._slider.y_align = Clutter.ActorAlign.CENTER;
+        this._slider.style_class = 'slider ds-slider';
+        container.add_child(this._slider);
+
+        this.add_child(container);
 
         this._slider.connect('notify::value', () => {
             const val = Math.round(this._min + this._slider.value * (this._max - this._min));
@@ -166,25 +191,12 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         this._isInternalUpdate = false;
         this._lastError = null;
 
-        // Top bar icon with live RGB indicator dot
-        const iconBox = new St.BoxLayout({
-            style_class: 'panel-status-indicators-box',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-
+        // Top bar icon: single centered symbolic icon matching native GNOME panel icons
         this._icon = new St.Icon({
             icon_name: 'display-brightness-symbolic',
             style_class: 'system-status-icon',
         });
-        iconBox.add_child(this._icon);
-
-        this._colorDot = new St.Bin({
-            style_class: 'ds-color-dot',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        iconBox.add_child(this._colorDot);
-
-        this.add_child(iconBox);
+        this.add_child(this._icon);
 
         this._buildMenu();
 
@@ -207,10 +219,12 @@ class DisplaySyncIndicator extends PanelMenu.Button {
             return Clutter.EVENT_PROPAGATE;
         });
 
-        // Trigger immediate status refresh when menu opens
+        // Optimization: poll status only when the dropdown menu is open
         this.menu.connect('open-state-changed', (_menu, isOpen) => {
             if (isOpen) {
-                this._pollStatus();
+                this._startPolling();
+            } else {
+                this._stopPolling();
             }
         });
     }
@@ -280,18 +294,18 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         });
         this.menu.addMenuItem(this._powerSwitch);
 
-        // 4. Reconnect Bulb Button
-        this._reconnectBtn = new PopupMenu.PopupMenuItem('🔄 Reconnect Bulb');
+        // 4. Reconnect Bulb Button (Adwaita symbolic icon, clean text, no emojis)
+        this._reconnectBtn = new PopupMenu.PopupImageMenuItem('Reconnect Bulb', 'view-refresh-symbolic');
         this._reconnectBtn.connect('activate', async () => {
-            this._reconnectBtn.label.text = '🔄 Connecting...';
+            this._reconnectBtn.label.text = 'Connecting...';
             const res = await this._sendApiRequest('/reconnect');
             if (res && res.status === 'ok') {
-                this._reconnectBtn.label.text = '✓ Connected';
+                this._reconnectBtn.label.text = 'Connected';
             } else {
-                this._reconnectBtn.label.text = '✕ Reconnect Failed';
+                this._reconnectBtn.label.text = 'Connection Failed';
             }
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-                this._reconnectBtn.label.text = '🔄 Reconnect Bulb';
+                this._reconnectBtn.label.text = 'Reconnect Bulb';
                 return GLib.SOURCE_REMOVE;
             });
             this._pollStatus();
@@ -300,7 +314,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // 5. Brightness Slider (10% - 100%, debounced ~80ms)
+        // 5. Brightness Slider (10% - 100%, full-width track, debounced ~80ms)
         this._brightnessSlider = new DebouncedSliderMenuItem(
             'display-brightness-symbolic',
             'Brightness',
@@ -312,9 +326,9 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         );
         this.menu.addMenuItem(this._brightnessSlider);
 
-        // 6. Responsiveness (Smoothing Alpha) Slider (30% - 95%, debounced ~80ms)
+        // 6. Responsiveness (Smoothing Alpha) Slider (30% - 95%, full-width track, debounced ~80ms)
         this._smoothingSlider = new DebouncedSliderMenuItem(
-            'preferences-system-performance-symbolic',
+            'preferences-system-symbolic',
             'Responsiveness',
             30,
             95,
@@ -324,7 +338,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         );
         this.menu.addMenuItem(this._smoothingSlider);
 
-        // 7. Refresh Rate Submenu (10, 12, 14, 15, 18, 20 Hz)
+        // 7. Refresh Rate Submenu (Header reflects active rate, e.g. "Refresh Rate (18 Hz)")
         this._hzSubMenu = new PopupMenu.PopupSubMenuMenuItem('Refresh Rate');
         this._hzItems = new Map();
         const hzOptions = [10, 12, 14, 15, 18, 20];
@@ -375,6 +389,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
 
     _setRefreshHz(hz) {
         this._sendApiRequest(`/refresh_hz?val=${hz}`);
+        this._hzSubMenu.label.text = `Refresh Rate (${hz} Hz)`;
         for (const [val, item] of this._hzItems) {
             item.setOrnament(val === hz ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
         }
@@ -392,7 +407,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         } else if (GLib.file_test(homeCfg, GLib.FileTest.EXISTS)) {
             return { path: '~/tuya_config.json', ok: true };
         }
-        return { path: 'Missing tuya_config.json', ok: false };
+        return { path: 'Not found', ok: false };
     }
 
     startService() {
@@ -410,7 +425,7 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         // Locate linux_sender.py inside the extension directory
         const scriptPath = GLib.build_filenamev([this._extension.path, 'linux_sender.py']);
         if (!GLib.file_test(scriptPath, GLib.FileTest.EXISTS)) {
-            this._statusLabel.set_text('Error: Script missing');
+            this._statusLabel.set_text('Service: Script missing');
             this._modeLabel.set_text(`linux_sender.py not found in ${this._extension.path}`);
             this._serviceSwitch.setToggleState(false);
             return;
@@ -449,7 +464,9 @@ class DisplaySyncIndicator extends PanelMenu.Button {
                 this._onProcessExited(exitStatus);
             });
 
-            this._startPolling();
+            if (this.menu.isOpen) {
+                this._startPolling();
+            }
         } catch (e) {
             this._subprocess = null;
             this._isInternalUpdate = true;
@@ -480,12 +497,11 @@ class DisplaySyncIndicator extends PanelMenu.Button {
     }
 
     stopService() {
+        this._stopPolling();
         if (!this._subprocess) {
             this._isInternalUpdate = true;
             this._serviceSwitch.setToggleState(false);
             this._isInternalUpdate = false;
-            this._stopPolling();
-            this._updateDot(40, 40, 40);
             this._statusLabel.set_text('Service: Stopped');
             this._modeLabel.set_text('Sender daemon idle');
             return;
@@ -501,7 +517,6 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         }
 
         this._statusLabel.set_text('Service: Stopping...');
-        this._stopPolling();
     }
 
     _onProcessExited(exitStatus) {
@@ -509,7 +524,6 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         this._serviceSwitch.setToggleState(false);
         this._isInternalUpdate = false;
         this._stopPolling();
-        this._updateDot(40, 40, 40);
 
         if (this._lastError) {
             this._statusLabel.set_text('Service: Stopped with Error');
@@ -562,7 +576,6 @@ class DisplaySyncIndicator extends PanelMenu.Button {
                 this._statusLabel.set_text('Service: Connecting...');
             } else {
                 this._statusLabel.set_text('Service: Stopped');
-                this._updateDot(40, 40, 40);
             }
             return;
         }
@@ -573,49 +586,50 @@ class DisplaySyncIndicator extends PanelMenu.Button {
     _updateUiFromData(data) {
         this._isInternalUpdate = true;
 
-        // 1. Live RGB color dot on the panel button
-        if (data.r !== undefined && data.g !== undefined && data.b !== undefined) {
-            this._updateDot(data.r, data.g, data.b);
-        }
-
-        // 2. Status labels
+        // 1. Status labels
         this._statusLabel.set_text('Service: Running');
         this._modeLabel.set_text(`Mode: ${data.mode || 'Active'}`);
         this._modeLabel.set_style_class_name('ds-subtext');
 
-        const adbText = data.adb_status === 'Connected' ? '✓ Connected' : '✕ Disconnected';
+        const adbText = data.adb_status === 'Connected' ? 'Connected' : 'Disconnected';
         this._phoneLabel.set_text(`Phone: ${adbText}`);
 
         const cfgInfo = this._checkConfigPath();
         this._configLabel.set_text(`Config: ${cfgInfo.path}`);
+        if (!cfgInfo.ok) {
+            this._configLabel.set_style_class_name('ds-subtext-error');
+        } else {
+            this._configLabel.set_style_class_name('ds-subtext');
+        }
 
-        // 3. Service switch state
+        // 2. Service switch state
         this._serviceSwitch.setToggleState(true);
 
-        // 4. Power switch
+        // 3. Power switch
         if (data.power !== undefined) {
             this._powerSwitch.setToggleState(data.power);
         }
 
-        // 5. Brightness slider
+        // 4. Brightness slider
         if (data.brightness !== undefined) {
             this._brightnessSlider.setValue(data.brightness);
         }
 
-        // 6. Smoothing slider
+        // 5. Smoothing slider
         if (data.smoothing_alpha !== undefined) {
             this._smoothingSlider.setValue(Math.round(data.smoothing_alpha * 100));
         }
 
-        // 7. Refresh rate selection
+        // 6. Refresh rate selection & Header text
         if (data.refresh_hz !== undefined) {
             const roundedHz = Math.round(data.refresh_hz);
+            this._hzSubMenu.label.text = `Refresh Rate (${roundedHz} Hz)`;
             for (const [hz, item] of this._hzItems) {
                 item.setOrnament(hz === roundedHz ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
             }
         }
 
-        // 8. Toggles
+        // 7. Toggles
         if (data.ethernet_only !== undefined) {
             this._ethernetSwitch.setToggleState(data.ethernet_only);
         }
@@ -630,12 +644,6 @@ class DisplaySyncIndicator extends PanelMenu.Button {
         }
 
         this._isInternalUpdate = false;
-    }
-
-    _updateDot(r, g, b) {
-        if (this._colorDot) {
-            this._colorDot.set_style(`background-color: rgb(${r}, ${g}, ${b});`);
-        }
     }
 
     destroy() {
