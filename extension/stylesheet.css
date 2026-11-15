@@ -1,0 +1,58 @@
+/* Display Sync GNOME Shell Extension Styles */
+
+.ds-color-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    margin-left: 3px;
+    background-color: #555555;
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    transition-duration: 200ms;
+}
+
+.ds-status-box {
+    padding: 6px 12px;
+    background-color: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    margin: 4px 6px;
+}
+
+.ds-status-title {
+    font-weight: bold;
+    font-size: 13px;
+    margin-bottom: 2px;
+}
+
+.ds-subtext {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.65);
+    line-height: 1.35;
+}
+
+.ds-subtext-error {
+    font-size: 11px;
+    color: #ff6b6b;
+    line-height: 1.35;
+}
+
+.ds-slider-row {
+    padding: 2px 6px;
+    spacing: 8px;
+}
+
+.ds-slider-label {
+    min-width: 140px;
+    font-size: 12px;
+}
+
+.ds-slider-value {
+    min-width: 44px;
+    text-align: right;
+    font-weight: bold;
+    font-family: monospace;
+    color: #ffb300;
+}
+
+.ds-icon {
+    icon-size: 16px;
+}

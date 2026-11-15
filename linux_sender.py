@@ -4,8 +4,8 @@ Mutter ScreenCast (PipeWire) Display Sync, Controller Rumble Interceptor & Tuya 
 -------------------------------------------------------------------------------------------------
 - Captures desktop color downscaled to 16x9 at the source (Mutter GPU compositor pass).
 - Phone Sync (ADB USB tcp:5555): sub-5ms low-latency ambient color + camera torch flash on rumble.
-- Tuya Bulb Sync: Exponential smoothing (soft transitions), rate-limited at 2 Hz, 30-100% brightness.
-- Web Brightness Slider: Live dark-mode slider at http://localhost:5556.
+- Tuya Bulb Sync: Exponential smoothing (soft transitions), persistent TCP with EOF/ACK watchdog & heartbeats.
+- Localhost JSON Control API: Lightweight control API at http://127.0.0.1:5556.
 - Fault-tolerant: Phone or Tuya bulb not being connected/configured never blocks or halts the pipeline.
 - Clean shutdown: On Ctrl-C or exit, closes app, sleeps phone, and shuts down pipeline.
 """
@@ -52,7 +52,22 @@ FPS_TARGET = 60
 WIDTH = 16
 HEIGHT = 9
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuya_config.json")
+def resolve_config_path(explicit_path: str = None) -> str:
+    """Resolves tuya_config.json path prioritizing user config dir so extension updates don't overwrite it."""
+    if explicit_path and os.path.isfile(explicit_path):
+        return explicit_path
+    user_cfg = os.path.expanduser("~/.config/display-sync/tuya_config.json")
+    if os.path.isfile(user_cfg):
+        return user_cfg
+    script_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tuya_config.json")
+    if os.path.isfile(script_cfg):
+        return script_cfg
+    home_cfg = os.path.expanduser("~/tuya_config.json")
+    if os.path.isfile(home_cfg):
+        return home_cfg
+    return user_cfg
+
+CONFIG_FILE = resolve_config_path()
 EMPTY_BODY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 TUYA_REGIONS = {
@@ -73,14 +88,32 @@ is_cleaning_up = False
 # Phone (ADB) Utilities
 # ==============================================================================
 
+_last_adb_check = 0.0
+_cached_adb_status = False
+
+def check_adb_device() -> bool:
+    """Checks if an authorized Android device is connected via ADB (cached for 2s)."""
+    global _last_adb_check, _cached_adb_status
+    now = time.time()
+    if now - _last_adb_check < 2.0:
+        return _cached_adb_status
+    _last_adb_check = now
+    try:
+        res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=1.5)
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip() and not line.startswith("List of")]
+        _cached_adb_status = any("\tdevice" in line for line in lines)
+    except Exception:
+        _cached_adb_status = False
+    return _cached_adb_status
+
 def unlock_and_launch_phone():
     """Wakes the phone, dismisses keyguard, and launches the app in fullscreen mode."""
     try:
         # 1. Wake screen if asleep (KEYCODE_WAKEUP = 224)
-        subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "input", "keyevent", "224"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         # 2. Dismiss keyguard cleanly via KEYCODE_MENU (82)
-        subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["adb", "shell", "input", "keyevent", "82"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "wm", "dismiss-keyguard"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        subprocess.run(["adb", "shell", "input", "keyevent", "82"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         time.sleep(0.3)
         # 3. Launch the app in foreground with fullscreen intent extra
         subprocess.run([
@@ -90,9 +123,9 @@ def unlock_and_launch_phone():
             "-c", "android.intent.category.LAUNCHER",
             "-n", "com.flashlight.torch/.MainActivity",
             "--ez", "hide_controls", "true"
-        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3.0)
         # 4. Broadcast HIDE_UI to ensure fullscreen
-        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
         print("[+] Phone wake & launch intent sent.")
     except Exception as e:
         print(f"[!] Notice: ADB unlock/launch skipped (phone not connected): {e}")
@@ -101,7 +134,7 @@ def unlock_and_launch_phone():
 def dismiss_initial_ui():
     """Ensures controls are hidden in the app upon connection."""
     try:
-        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "am", "broadcast", "-a", "com.flashlight.torch.HIDE_UI"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
     except Exception:
         pass
 
@@ -115,13 +148,16 @@ def cleanup_phone_and_exit(sync_instance=None):
 
     print("\n[*] Shutting down: closing app and turning off phone screen...")
     try:
-        subprocess.run(["adb", "shell", "am", "force-stop", "com.flashlight.torch"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["adb", "shell", "input", "keyevent", "223"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["adb", "shell", "am", "force-stop", "com.flashlight.torch"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        subprocess.run(["adb", "shell", "input", "keyevent", "223"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
     except Exception:
         pass
 
     if sync_instance:
-        sync_instance.stop()
+        try:
+            sync_instance.stop()
+        except Exception:
+            pass
 
 
 def setup_adb_forward(port: int):
@@ -205,7 +241,6 @@ def monitor_controller_vibration(device_path=None, simulate=False):
 
 
 # ==============================================================================
-# ==============================================================================
 # Tuya Local (Wi-Fi Persistent Socket) & Cloud API Smart Bulb Synchronizer
 # ==============================================================================
 
@@ -222,6 +257,7 @@ def get_ip_address(ifname: str) -> str:
     except Exception:
         return None
 
+
 def get_ethernet_ip() -> str:
     """Finds the IP address of the Ethernet/USB tether interface (excluding hotspot wlp2s0)."""
     try:
@@ -233,6 +269,7 @@ def get_ethernet_ip() -> str:
     except Exception:
         pass
     return None
+
 
 if HAS_TINYTUYA:
     class BoundBulbDevice(tinytuya.BulbDevice):
@@ -285,12 +322,12 @@ else:
     class BoundBulbDevice:
         pass
 
+
 class TuyaLocalDevice:
     """
     Controls Tuya bulb directly over local network using BoundBulbDevice
     with a persistent TCP socket (~10-20 Hz, sub-10ms latency).
-    Can bind exclusively to Ethernet so the Wi-Fi hotspot is 100% reserved for InputLeap.
-    Recovers cleanly upon disconnect or USB phone unplug/replug.
+    Detects silent EOF disconnects, sends keepalive heartbeats, and auto-recovers.
     """
     def __init__(self, device_id: str, local_ip: str, local_key: str, version: float = 3.5, bind_ip: str = None):
         self.device_id = device_id.strip()
@@ -302,6 +339,9 @@ class TuyaLocalDevice:
         self.is_connected = False
         self.lock = threading.Lock()
         self.last_attempt_time = 0
+        self.last_send_time = 0
+        self.last_rx_time = 0
+        self.tx_since_rx = 0
 
     def set_bind_ip(self, bind_ip: str):
         with self.lock:
@@ -365,6 +405,15 @@ class TuyaLocalDevice:
                         pass
                     return False
 
+                # Enable OS kernel TCP Keepalive
+                try:
+                    bulb.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    bulb.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+                    bulb.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+                    bulb.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                except Exception:
+                    pass
+
                 # Ensure bulb is powered on in colour mode
                 res = bulb.set_multiple_values({'20': True, '21': 'colour'}, nowait=True)
                 if isinstance(res, dict) and ('Error' in res or 'Err' in res):
@@ -376,29 +425,68 @@ class TuyaLocalDevice:
 
                 self.bulb = bulb
                 self.is_connected = True
+                self.last_send_time = now
+                self.last_rx_time = now
+                self.tx_since_rx = 0
                 self._drain_socket()
                 return True
             except Exception:
                 self._close_socket()
                 return False
 
-    def _drain_socket(self):
-        """Drains incoming response packets non-blocking so the TCP buffer never accumulates."""
-        if self.bulb and getattr(self.bulb, 'socket', None):
+    def _drain_socket(self) -> bool:
+        """
+        Drains incoming ACK/heartbeat packets non-blocking.
+        Returns False if the bulb closed the socket (EOF) or raised a socket error.
+        """
+        if not self.bulb or not getattr(self.bulb, 'socket', None):
+            self._close_socket()
+            return False
+
+        sock = self.bulb.socket
+        try:
+            sock.setblocking(False)
+            while True:
+                data = sock.recv(4096)
+                if data == b"":
+                    # Remote peer (bulb) cleanly closed the TCP connection (FIN)
+                    self._close_socket()
+                    return False
+                # Received valid ACK/status bytes from the bulb
+                self.last_rx_time = time.time()
+                self.tx_since_rx = 0
+        except BlockingIOError:
+            # Normal when buffer is completely drained and connection is still open
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self._close_socket()
+            return False
+        finally:
             try:
-                self.bulb.socket.setblocking(False)
-                while True:
-                    data = self.bulb.socket.recv(4096)
-                    if not data:
-                        break
+                if self.bulb and getattr(self.bulb, 'socket', None):
+                    self.bulb.socket.setblocking(True)
             except Exception:
                 pass
-            finally:
-                try:
-                    if self.bulb and getattr(self.bulb, 'socket', None):
-                        self.bulb.socket.setblocking(True)
-                except Exception:
-                    pass
+
+    def send_heartbeat(self) -> bool:
+        """Sends a lightweight Tuya heartbeat (CMD 9) to prevent the bulb's 30s idle disconnect."""
+        if not self.is_connected or not self.bulb or not getattr(self.bulb, 'socket', None):
+            return self.connect()
+
+        with self.lock:
+            if not self._drain_socket():
+                return False
+            try:
+                res = self.bulb.heartbeat(nowait=True)
+                if isinstance(res, dict) and ('Error' in res or 'Err' in res):
+                    self._close_socket()
+                    return False
+                self.last_send_time = time.time()
+                self.tx_since_rx += 1
+                return self._drain_socket()
+            except Exception:
+                self._close_socket()
+                return False
 
     def send_hsv(self, h: int, s: int, v: int) -> bool:
         """Sends HSV color directly over local Wi-Fi TCP socket (non-blocking nowait=True)."""
@@ -408,13 +496,23 @@ class TuyaLocalDevice:
 
         hex_val = f"{int(h):04x}{int(s):04x}{int(v):04x}"
         with self.lock:
+            if not self._drain_socket():
+                return False
+
+            # If we sent >25 packets (~2s of active streaming) without a single ACK byte
+            # coming back from the bulb, the v3.5 session is zombie/desynced -> force reconnect
+            if self.tx_since_rx > 25 and (time.time() - self.last_rx_time > 2.5):
+                self._close_socket()
+                return False
+
             try:
                 res = self.bulb.set_value('24', hex_val, nowait=True)
                 if (isinstance(res, dict) and ('Error' in res or 'Err' in res)) or not getattr(self.bulb, 'socket', None):
                     self._close_socket()
                     return False
-                self._drain_socket()
-                return True
+                self.last_send_time = time.time()
+                self.tx_since_rx += 1
+                return self._drain_socket()
             except Exception:
                 self._close_socket()
                 return False
@@ -426,6 +524,8 @@ class TuyaLocalDevice:
                 return False
 
         with self.lock:
+            if not self._drain_socket():
+                return False
             try:
                 res = self.bulb.set_multiple_values({
                     '20': True,
@@ -436,8 +536,9 @@ class TuyaLocalDevice:
                 if (isinstance(res, dict) and ('Error' in res or 'Err' in res)) or not getattr(self.bulb, 'socket', None):
                     self._close_socket()
                     return False
-                self._drain_socket()
-                return True
+                self.last_send_time = time.time()
+                self.tx_since_rx += 1
+                return self._drain_socket()
             except Exception:
                 self._close_socket()
                 return False
@@ -457,8 +558,9 @@ class TuyaLocalDevice:
                     if isinstance(res, dict) and ('Error' in res or 'Err' in res):
                         self._close_socket()
                         return False
-                    self._drain_socket()
-                    return True
+                    self.last_send_time = time.time()
+                    self.tx_since_rx += 1
+                    return self._drain_socket()
                 return False
             except Exception:
                 self._close_socket()
@@ -659,18 +761,18 @@ class TuyaCloudClient:
 class TuyaBulbSync:
     """
     Tuya Smart Bulb Controller:
-    - Direct Wi-Fi local socket via tinytuya.BulbDevice (persistent TCP, ~12 Hz)
+    - Direct Wi-Fi local socket via tinytuya.BulbDevice (persistent TCP, ~15 Hz)
     - Full color range expansion: saturation weighting so colors pop and never wash out to white
-    - Dynamic brightness shifts: bulb scales dynamically with screen luminance (clamped 30%-100%)
-    - Smooth gradient easing: shortest circular path Hue and linear Saturation/Value interpolation
+    - Dynamic brightness shifts: bulb scales dynamically with screen luminance (clamped 10%-100%)
+    - Smooth gradient easing: linear RGB cross-fade + adaptive snappiness
     - Fallback: Tuya Cloud OpenAPI if local network is unavailable
-    - Web slider server: real-time brightness and dynamic mode control at http://localhost:5556
+    - JSON control API: real-time brightness and dynamic mode control at http://127.0.0.1:5556
     """
-    def __init__(self, config_path: str = CONFIG_FILE, cli_brightness: int = None,
+    def __init__(self, config_path: str = None, cli_brightness: int = None,
                  cli_id: str = None, cli_secret: str = None, cli_device: str = None,
                  cli_region: str = None, cli_ip: str = None, cli_key: str = None,
                  cli_dynamic: bool = None, cli_hz: float = None):
-        self.config_path = config_path
+        self.config_path = resolve_config_path(config_path)
         self.config = self.load_config()
 
         changed = False
@@ -840,6 +942,8 @@ class TuyaBulbSync:
         if conf is None:
             conf = self.config
         try:
+            cfg_dir = os.path.dirname(os.path.abspath(self.config_path))
+            os.makedirs(cfg_dir, exist_ok=True)
             with open(self.config_path, "w") as f:
                 json.dump(conf, f, indent=2)
         except Exception:
@@ -867,6 +971,9 @@ class TuyaBulbSync:
         self.save_config()
 
     def force_reconnect(self) -> bool:
+        with self.lock:
+            self.last_sent_hsv = (-1, -1, -1)
+            self.last_sent_white = -1
         if self.local_device:
             self.local_device.disconnect()
             eth = get_ethernet_ip()
@@ -903,6 +1010,8 @@ class TuyaBulbSync:
             self.config["use_ethernet_only"] = self.use_ethernet_only
             self.ethernet_ip = get_ethernet_ip()
             bind_ip = self.ethernet_ip if self.use_ethernet_only else None
+            self.last_sent_hsv = (-1, -1, -1)
+            self.last_sent_white = -1
         self.save_config()
         if self.local_device:
             self.local_device.set_bind_ip(bind_ip)
@@ -1014,14 +1123,25 @@ class TuyaBulbSync:
                         if self.local_device:
                             self.local_device.disconnect()
                             self.local_device.set_bind_ip(detected_eth)
-                            self.local_device.connect()
+                            if self.local_device.connect():
+                                self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
+                                self.last_sent_hsv = (-1, -1, -1)
+                                self.last_sent_white = -1
                         if old_eth and not detected_eth:
                             print(f"\n[*] Phone unplugged: automatic fallback to local Wi-Fi for bulb streaming")
                         elif detected_eth and not old_eth:
                             print(f"\n[*] Phone plugged in: switched bulb streaming to USB Ethernet ({detected_eth})")
                     elif self.local_device and not self.local_device.is_connected:
                         # Auto-reconnect if dropped or after phone replug
-                        self.local_device.connect()
+                        if self.local_device.connect():
+                            self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
+                            self.last_sent_hsv = (-1, -1, -1)
+                            self.last_sent_white = -1
+                elif self.local_device and not self.local_device.is_connected:
+                    if self.local_device.connect():
+                        self.mode = "Local Wi-Fi"
+                        self.last_sent_hsv = (-1, -1, -1)
+                        self.last_sent_white = -1
 
             with self.lock:
                 power = self.power_on
@@ -1058,6 +1178,21 @@ class TuyaBulbSync:
                             self.mode = "Cloud OpenAPI"
                     if sent:
                         self.last_sent_white = b_val
+                    else:
+                        self.mode = "Disconnected"
+                        self.last_sent_white = -1
+                else:
+                    # Keep White Mode persistent TCP socket alive with heartbeats
+                    if self.local_device:
+                        if now - self.local_device.last_send_time >= 8.0:
+                            if not self.local_device.send_heartbeat():
+                                self.mode = "Disconnected"
+                                self.last_sent_white = -1
+                        else:
+                            with self.local_device.lock:
+                                if not self.local_device._drain_socket():
+                                    self.mode = "Disconnected"
+                                    self.last_sent_white = -1
                 continue
 
             # Display Sync Mode (Eased RGB linear cross-fade with adaptive snappiness):
@@ -1069,9 +1204,6 @@ class TuyaBulbSync:
             self.curr_b += eff_alpha * (tb - self.curr_b)
 
             # 2. Dynamic brightness target:
-            # - On pure white: pushes all the way to 100% brightness
-            # - Generally keeps brightness decently high unless the scene has a lot of blacks in it
-            # - When the scene has a lot of blacks, drops cleanly to the 10% minimum clamp
             if dyn:
                 eff_light = max(tlum, 0.35 * tpeak, 0.45 * tbloom)
                 # Strong dark factor only when screen has a significant portion of black pixels
@@ -1133,12 +1265,19 @@ class TuyaBulbSync:
             v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
             self.current_display_b = int(v_tuya / 10)
 
-            # 4. Deadband check: send if changed
+            # 4. Deadband check: send if changed, or send heartbeat if static for >8s
             last_h, last_s, last_v = self.last_sent_hsv
             th_h = 1 if is_local else 3
             th_s = 2 if is_local else 8
             th_v = 2 if is_local else 6
-            if abs(h_tuya - last_h) >= th_h or abs(s_tuya - last_s) >= th_s or abs(v_tuya - last_v) >= th_v:
+
+            color_changed = (
+                abs(h_tuya - last_h) >= th_h or
+                abs(s_tuya - last_s) >= th_s or
+                abs(v_tuya - last_v) >= th_v
+            )
+
+            if color_changed:
                 sent = False
                 if self.local_device:
                     sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
@@ -1156,6 +1295,21 @@ class TuyaBulbSync:
                     self.last_sent_white = -1
                 else:
                     self.mode = "Disconnected"
+                    # Reset last_sent_hsv so as soon as it reconnects next tick, it forces a color update
+                    self.last_sent_hsv = (-1, -1, -1)
+            else:
+                # Screen is static: keep local TCP connection alive & check for silent EOF
+                if self.local_device:
+                    if now - self.local_device.last_send_time >= 8.0:
+                        if not self.local_device.send_heartbeat():
+                            self.mode = "Disconnected"
+                            self.last_sent_hsv = (-1, -1, -1)
+                    else:
+                        # Still poll _drain_socket so we catch remote disconnects and ACKs immediately
+                        with self.local_device.lock:
+                            if not self.local_device._drain_socket():
+                                self.mode = "Disconnected"
+                                self.last_sent_hsv = (-1, -1, -1)
 
     def start(self):
         if not self.enabled:
@@ -1190,7 +1344,7 @@ class TuyaBulbSync:
     def mode_short(self) -> str:
         if not self.power_on:
             return "Off"
-        if self.mode in ("Local Ethernet", "Local Wi-Fi"):
+        if self.mode in ("Local Ethernet", "Local Wi-Fi", "Disconnected"):
             base = self.mode
         elif self.mode.startswith("Local"):
             base = self.mode
@@ -1206,343 +1360,24 @@ class TuyaBulbSync:
     def _start_web_server(self):
         sync_self = self
 
-        class SliderHandler(BaseHTTPRequestHandler):
+        class ApiHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass
 
+            def _send_json(self, data: dict, status_code: int = 200):
+                body = json.dumps(data).encode('utf-8')
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_GET(self):
                 parsed = urlparse(self.path)
-                if parsed.path == "/":
-                    with sync_self.lock:
-                        b = sync_self.brightness
-                        dyn = sync_self.dynamic_brightness
-                        flash = sync_self.phone_flash_enabled
-                        white = sync_self.white_mode
-                        eth = sync_self.use_ethernet_only
-                        power = sync_self.power_on
-                        cur_hz = sync_self.local_hz
-                        cur_alpha = sync_self.alpha
-                        mode_str = sync_self.mode
-                        if not power:
-                            r_d, g_d, b_d = 40, 40, 40
-                            display_mode = f"{mode_str} (Off)"
-                        elif white:
-                            r_d, g_d, b_d = 255, 255, 255
-                            display_mode = f"{mode_str} (White)"
-                        else:
-                            r_d = int(max(0.0, min(1.0, sync_self.curr_r)) * 255)
-                            g_d = int(max(0.0, min(1.0, sync_self.curr_g)) * 255)
-                            b_d = int(max(0.0, min(1.0, sync_self.curr_b)) * 255)
-                            display_mode = mode_str
+                path = parsed.path
 
-                    dyn_checked = "checked" if dyn else ""
-                    flash_checked = "checked" if flash else ""
-                    white_checked = "checked" if white else ""
-                    eth_checked = "checked" if eth else ""
-                    power_checked = "checked" if power else ""
-                    hz_options = [10, 12, 14, 15, 18, 20]
-                    hz_options_html = "".join([f'<option value="{opt}"{" selected" if int(round(cur_hz)) == opt else ""}>{opt} Hz</option>' for opt in hz_options])
-                    alpha_pct = int(round(cur_alpha * 100))
-                    html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Display Sync Controls</title>
-    <style>
-        body {{
-            background: #111116;
-            color: #f0f0f5;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            margin: 0;
-        }}
-        .card {{
-            background: #1b1b24;
-            padding: 28px 24px;
-            border-radius: 20px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.6);
-            width: 330px;
-            text-align: center;
-            border: 1px solid rgba(255,255,255,0.08);
-        }}
-        h2 {{ margin: 0 0 8px; font-size: 20px; }}
-        .badge {{
-            display: inline-block;
-            background: rgba(76, 175, 80, 0.2);
-            color: #4CAF50;
-            padding: 4px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: bold;
-            margin-bottom: 12px;
-        }}
-        .swatch {{
-            width: 64px;
-            height: 64px;
-            border-radius: 50%;
-            margin: 6px auto 12px;
-            border: 3px solid rgba(255,255,255,0.2);
-            transition: background 0.15s ease;
-            background: rgb({r_d},{g_d},{b_d});
-        }}
-        .val {{
-            font-size: 30px;
-            font-weight: bold;
-            color: #ffb300;
-            margin: 8px 0;
-            font-family: monospace;
-        }}
-        input[type=range] {{
-            width: 100%;
-            margin: 12px 0 8px;
-            accent-color: #ffb300;
-            height: 8px;
-            border-radius: 4px;
-            outline: none;
-        }}
-        .toggle-box {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            background: rgba(255,255,255,0.05);
-            padding: 9px 14px;
-            border-radius: 12px;
-            margin: 8px 0;
-            font-size: 13px;
-        }}
-        .btn-reconnect {{
-            width: 100%;
-            background: rgba(255, 179, 0, 0.12);
-            color: #ffb300;
-            border: 1px solid rgba(255, 179, 0, 0.35);
-            border-radius: 12px;
-            padding: 10px 14px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            margin: 8px 0;
-            transition: all 0.2s ease;
-        }}
-        .btn-reconnect:hover {{
-            background: rgba(255, 179, 0, 0.22);
-            border-color: #ffb300;
-        }}
-        .btn-reconnect:active {{
-            transform: scale(0.98);
-        }}
-        .sub {{
-            color: rgba(255,255,255,0.45);
-            font-size: 11px;
-            line-height: 1.4;
-            margin-top: 6px;
-        }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>💡 Ambient Sync Control</h2>
-        <div class="badge" id="mode-badge">{display_mode}</div>
-        <div class="swatch" id="swatch"></div>
-        <div class="sub">Bulb Brightness</div>
-        <div class="val" id="val">{b}%</div>
-        <input type="range" min="10" max="100" value="{b}" id="slider" oninput="update(this.value)">
-        <div class="toggle-box" style="border: 1px solid rgba(255, 179, 0, 0.25); background: rgba(255, 179, 0, 0.05);">
-            <span style="font-weight: 600; color: #ffb300;">💡 Bulb Power</span>
-            <input type="checkbox" id="power-toggle" {power_checked} onchange="togglePower(this.checked)">
-        </div>
-        <button id="reconnect-btn" class="btn-reconnect" onclick="reconnectBulb()">🔄 Reconnect Bulb</button>
-        <div class="toggle-box">
-            <span>Refresh Rate</span>
-            <select id="hz-select" style="background:#282836; color:#ffb300; border:1px solid rgba(255,255,255,0.15); border-radius:6px; padding:3px 8px; font-weight:bold; outline:none; font-size:12px;" onchange="updateHz(this.value)">
-                {hz_options_html}
-            </select>
-        </div>
-        <div class="toggle-box">
-            <span>Responsiveness (Speed)</span>
-            <span id="alpha-val" style="font-weight:bold; color:#ffb300;">{alpha_pct}%</span>
-        </div>
-        <input type="range" min="30" max="95" value="{alpha_pct}" id="alpha-slider" oninput="updateAlpha(this.value)">
-        <div class="toggle-box">
-            <span>Ethernet Only (Isolate Hotspot)</span>
-            <input type="checkbox" id="eth-toggle" {eth_checked} onchange="toggleEth(this.checked)">
-        </div>
-        <div class="toggle-box">
-            <span>Normal White Mode</span>
-            <input type="checkbox" id="white-toggle" {white_checked} onchange="toggleWhite(this.checked)">
-        </div>
-        <div class="toggle-box">
-            <span>Dynamic Bulb Shifts</span>
-            <input type="checkbox" id="dyn-toggle" {dyn_checked} onchange="toggleDyn(this.checked)">
-        </div>
-        <div class="toggle-box">
-            <span>Phone Torch on Rumble</span>
-            <input type="checkbox" id="flash-toggle" {flash_checked} onchange="toggleFlash(this.checked)">
-        </div>
-        <div class="sub">Min 10% clamp prevents cutoff & flicker</div>
-    </div>
-    <script>
-        function update(v) {{
-            document.getElementById('val').innerText = v + '%';
-            fetch('/brightness?val=' + v);
-        }}
-        function updateHz(v) {{
-            fetch('/refresh_hz?val=' + v);
-        }}
-        function updateAlpha(v) {{
-            document.getElementById('alpha-val').innerText = v + '%';
-            fetch('/smoothing?val=' + v);
-        }}
-        function reconnectBulb() {{
-            let btn = document.getElementById('reconnect-btn');
-            if (btn) btn.innerText = 'Connecting...';
-            fetch('/reconnect')
-                .then(r => r.json())
-                .then(d => {{
-                    if (btn) btn.innerText = d.status === 'ok' ? '✓ Connected' : '✕ Reconnect Failed';
-                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
-                    fetchStatus();
-                }})
-                .catch(() => {{
-                    if (btn) btn.innerText = '✕ Error';
-                    setTimeout(() => {{ if (btn) btn.innerText = '🔄 Reconnect Bulb'; }}, 2000);
-                }});
-        }}
-        function togglePower(checked) {{
-            fetch('/power_toggle?val=' + (checked ? '1' : '0'));
-        }}
-        function toggleEth(checked) {{
-            fetch('/ethernet_toggle?val=' + (checked ? '1' : '0'));
-        }}
-        function toggleWhite(checked) {{
-            fetch('/white_mode?val=' + (checked ? '1' : '0'));
-        }}
-        function toggleDyn(checked) {{
-            fetch('/dynamic?val=' + (checked ? '1' : '0'));
-        }}
-        function toggleFlash(checked) {{
-            fetch('/phone_flash?val=' + (checked ? '1' : '0'));
-        }}
-        async function fetchStatus() {{
-            if (document.hidden) return;
-            try {{
-                let r = await fetch('/status');
-                let d = await r.json();
-                document.getElementById('swatch').style.background = 'rgb(' + d.r + ',' + d.g + ',' + d.b + ')';
-                document.getElementById('mode-badge').innerText = d.mode;
-                let hzSelect = document.getElementById('hz-select');
-                if (hzSelect && document.activeElement !== hzSelect && d.refresh_hz) {{
-                    hzSelect.value = String(Math.round(d.refresh_hz));
-                }}
-                let aSlider = document.getElementById('alpha-slider');
-                if (aSlider && document.activeElement !== aSlider && d.smoothing_alpha) {{
-                    let pct = Math.round(d.smoothing_alpha * 100);
-                    aSlider.value = pct;
-                    document.getElementById('alpha-val').innerText = pct + '%';
-                }}
-            }} catch(e) {{}}
-        }}
-        setInterval(fetchStatus, 5000);
-    </script>
-</body>
-</html>"""
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(html.encode('utf-8'))
-
-                elif parsed.path == "/brightness":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        try:
-                            sync_self.set_brightness(int(qs["val"][0]))
-                        except Exception:
-                            pass
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/refresh_hz":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        try:
-                            sync_self.set_refresh_hz(float(qs["val"][0]))
-                        except Exception:
-                            pass
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/smoothing":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        try:
-                            sync_self.set_smoothing_alpha(float(qs["val"][0]) / 100.0)
-                        except Exception:
-                            pass
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/reconnect":
-                    ok = sync_self.force_reconnect()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}' if ok else b'{"status":"failed"}')
-
-                elif parsed.path == "/power_toggle":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        sync_self.set_power(qs["val"][0] == "1")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/ethernet_toggle":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        sync_self.set_ethernet_only(qs["val"][0] == "1")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/white_mode":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        sync_self.set_white_mode(qs["val"][0] == "1")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/dynamic":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        sync_self.set_dynamic_brightness(qs["val"][0] == "1")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/phone_flash":
-                    qs = parse_qs(parsed.query)
-                    if "val" in qs:
-                        sync_self.set_phone_flash(qs["val"][0] == "1")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status":"ok"}')
-
-                elif parsed.path == "/status":
+                if path == "/status":
                     with sync_self.lock:
                         b = sync_self.brightness
                         dyn = sync_self.dynamic_brightness
@@ -1566,10 +1401,8 @@ class TuyaBulbSync:
                             b_d = int(max(0.0, min(1.0, sync_self.curr_b)) * 255)
                             display_mode = mode_str
 
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
+                    adb_connected = check_adb_device()
+                    self._send_json({
                         "brightness": b,
                         "dynamic": dyn,
                         "phone_flash": flash,
@@ -1580,19 +1413,92 @@ class TuyaBulbSync:
                         "refresh_hz": cur_hz,
                         "smoothing_alpha": cur_alpha,
                         "mode": display_mode,
-                        "r": r_d, "g": g_d, "b": b_d
-                    }).encode('utf-8'))
+                        "r": r_d,
+                        "g": g_d,
+                        "b": b_d,
+                        "adb_connected": adb_connected,
+                        "adb_status": "Connected" if adb_connected else "Disconnected"
+                    })
+
+                elif path == "/brightness":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        try:
+                            sync_self.set_brightness(int(qs["val"][0]))
+                        except Exception:
+                            pass
+                    self._send_json({"status": "ok", "brightness": sync_self.brightness})
+
+                elif path == "/refresh_hz":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        try:
+                            sync_self.set_refresh_hz(float(qs["val"][0]))
+                        except Exception:
+                            pass
+                    self._send_json({"status": "ok", "refresh_hz": sync_self.local_hz})
+
+                elif path == "/smoothing":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        try:
+                            sync_self.set_smoothing_alpha(float(qs["val"][0]) / 100.0)
+                        except Exception:
+                            pass
+                    self._send_json({"status": "ok", "smoothing_alpha": sync_self.alpha})
+
+                elif path == "/reconnect":
+                    ok = sync_self.force_reconnect()
+                    self._send_json({"status": "ok" if ok else "failed", "mode": sync_self.mode})
+
+                elif path == "/power_toggle":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_power(qs["val"][0] == "1")
+                    self._send_json({"status": "ok", "power": sync_self.power_on})
+
+                elif path == "/ethernet_toggle":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_ethernet_only(qs["val"][0] == "1")
+                    self._send_json({"status": "ok", "ethernet_only": sync_self.use_ethernet_only})
+
+                elif path == "/white_mode":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_white_mode(qs["val"][0] == "1")
+                    self._send_json({"status": "ok", "white_mode": sync_self.white_mode})
+
+                elif path == "/dynamic":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_dynamic_brightness(qs["val"][0] == "1")
+                    self._send_json({"status": "ok", "dynamic": sync_self.dynamic_brightness})
+
+                elif path == "/phone_flash":
+                    qs = parse_qs(parsed.query)
+                    if "val" in qs:
+                        sync_self.set_phone_flash(qs["val"][0] == "1")
+                    self._send_json({"status": "ok", "phone_flash": sync_self.phone_flash_enabled})
+
+                elif path == "/":
+                    self._send_json({"service": "display-sync", "status": "running"})
+
                 else:
-                    self.send_response(404)
-                    self.end_headers()
+                    self._send_json({"error": "not found"}, status_code=404)
+
+        class ReusableHTTPServer(HTTPServer):
+            allow_reuse_address = True
 
         def run_server():
             try:
-                server = HTTPServer(("0.0.0.0", self.web_port), SliderHandler)
-                print(f"[+] Tuya Brightness Web Slider running at: http://localhost:{self.web_port}")
+                server = ReusableHTTPServer(("127.0.0.1", self.web_port), ApiHandler)
+                print(f"[+] Display Sync JSON Control API running at: http://127.0.0.1:{self.web_port}")
                 server.serve_forever()
             except Exception as e:
-                print(f"[!] Warning: Tuya Web Slider server failed on port {self.web_port}: {e}")
+                print(f"[!] Warning: Control API server failed on port {self.web_port}: {e}")
+
+        threading.Thread(target=run_server, daemon=True).start()
 
         threading.Thread(target=run_server, daemon=True).start()
 
@@ -1869,10 +1775,7 @@ def main():
 
     # 2. Signal handlers for clean exit on Ctrl-C or SIGTERM
     def sig_handler(*_):
-        if not sync.skip_phone:
-            cleanup_phone_and_exit(sync)
-        else:
-            sync.stop()
+        cleanup_phone_and_exit(sync)
         if sync.loop and sync.loop.is_running():
             sync.loop.quit()
         sys.exit(0)
@@ -1880,12 +1783,23 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
     try:
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, sig_handler)
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, sig_handler)
+        try:
+            from gi.repository import GLibUnix
+            signal_add_fn = GLibUnix.signal_add
+        except (ImportError, AttributeError):
+            signal_add_fn = GLib.unix_signal_add
+
+        def glib_sig():
+            cleanup_phone_and_exit(sync)
+            if sync.loop and sync.loop.is_running():
+                sync.loop.quit()
+            return GLib.SOURCE_REMOVE
+
+        signal_add_fn(GLib.PRIORITY_HIGH, signal.SIGINT, glib_sig)
+        signal_add_fn(GLib.PRIORITY_HIGH, signal.SIGTERM, glib_sig)
     except Exception:
         pass
-    if not sync.skip_phone:
-        atexit.register(cleanup_phone_and_exit, sync)
+    atexit.register(cleanup_phone_and_exit, sync)
 
     # 3. Start rumble monitoring
     vibe_thread = threading.Thread(

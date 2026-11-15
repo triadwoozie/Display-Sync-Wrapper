@@ -118,7 +118,16 @@ Fill in your device details in `tuya_config.json` (see `tuya_config.example.json
 }
 ```
 
-### 3. Start the Linux Sender
+### 3. GNOME 45+ Shell Extension (`display-sync@triadwoozie`)
+You can control Display Sync natively from the GNOME top bar with the included extension:
+- **Top Panel Menu**: Master daemon switch, live RGB indicator dot, Bulb Power toggle, Reconnect Bulb button, Brightness slider (10%–100%), Responsiveness slider (30%–95%), Refresh Rate selector (10–20 Hz), and feature toggles (Ethernet Only, White Mode, Dynamic Shifts, Phone Torch on Rumble).
+- **Auto-start**: Starts automatically on login without relying on desktop startup scripts.
+- **Install**:
+```bash
+./install-extension.sh
+```
+
+### 4. Start the Linux Sender Manually (CLI)
 From the repository root:
 ```bash
 ./run_sender.sh

@@ -1,0 +1,16 @@
+{
+  "name": "Display Sync",
+  "description": "Ambient display lighting synchronizer for Tuya Smart Bulbs and Android devices via Mutter GPU compositor capture.",
+  "uuid": "display-sync@triadwoozie",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51"
+  ],
+  "url": "https://github.com/triadwoozie/Display-Sync-Wrapper",
+  "version": 1
+}
