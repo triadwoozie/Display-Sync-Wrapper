@@ -200,6 +200,12 @@ class DisplaySyncIndicator extends PanelMenu.Button {
 
         this._buildMenu();
 
+        // Prevent menu from closing when modifying settings or interacting with menu items
+        this.menu.itemActivated = () => {};
+        if (this._hzSubMenu && this._hzSubMenu.menu) {
+            this._hzSubMenu.menu.itemActivated = () => {};
+        }
+
         // Top bar scroll-wheel shortcut: scroll over icon to adjust brightness +/- 5%
         this.connect('scroll-event', (_actor, event) => {
             const direction = event.get_scroll_direction();
