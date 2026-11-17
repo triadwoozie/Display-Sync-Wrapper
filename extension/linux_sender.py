@@ -458,7 +458,9 @@ class TuyaLocalDevice:
 
                 self.bulb = bulb
                 self.is_connected = True
-                self.bind_fail_count = 0
+                # ONLY reset bind_fail_count if we actually connected using bind_ip!
+                if effective_bind_ip:
+                    self.bind_fail_count = 0
                 self.last_send_time = time.time()
                 if not self._drain_socket():
                     self._close_socket()
@@ -492,6 +494,32 @@ class TuyaLocalDevice:
             return True
         except Exception:
             return False
+
+    def poll_and_heartbeat(self, now: float) -> bool:
+        """
+        1. Constantly drains delayed async ACKs from the bulb on every loop tick.
+        2. Sends a Tuya 0x09 heartbeat every 3.5s when idle so the MCU never drops
+           the session key or enters Wi-Fi DTIM power-save sleep.
+        """
+        if not self.is_connected or not self.bulb or not getattr(self.bulb, 'socket', None):
+            return False
+
+        with self.lock:
+            if not self._drain_socket():
+                self._close_socket()
+                return False
+
+            if now - self.last_send_time >= 3.5:
+                try:
+                    self.bulb.heartbeat(nowait=True)
+                    self.last_send_time = now
+                    if not self._drain_socket():
+                        self._close_socket()
+                        return False
+                except Exception:
+                    self._close_socket()
+                    return False
+            return True
 
     def send_hsv(self, h: int, s: int, v: int) -> bool:
         """Sends HSV color directly over local Wi-Fi TCP socket (non-blocking nowait=True)."""
@@ -1216,6 +1244,9 @@ class TuyaBulbSync:
                             sent = True
                     if sent:
                         self.last_sent_white = b_val
+                elif self.local_device and self.local_device.is_connected:
+                    if not self.local_device.poll_and_heartbeat(time.time()):
+                        self.local_device.connect()
                 time.sleep(interval)
                 continue
 
@@ -1279,35 +1310,52 @@ class TuyaBulbSync:
             v_tuya = int(max(min_b * 10, min(1000, self.curr_v)))
             self.current_display_b = int(v_tuya / 10)
 
-            # Deadband check: send if changed, or periodic keepalive every 4s if idle
+            # Deadband check: send if changed, or periodic keepalive every 3.5s if idle
             last_h, last_s, last_v = self.last_sent_hsv
             th_h = 2 if is_local else 4
             th_s = 4 if is_local else 10
             th_v = 4 if is_local else 8
-            changed = (abs(h_tuya - last_h) >= th_h or abs(s_tuya - last_s) >= th_s or abs(v_tuya - last_v) >= th_v)
+            now = time.time()
+            idle_keepalive = (
+                is_local
+                and self.local_device
+                and (now - self.local_device.last_send_time >= 3.5)
+            )
+            changed = (
+                abs(h_tuya - last_h) >= th_h
+                or abs(s_tuya - last_s) >= th_s
+                or abs(v_tuya - last_v) >= th_v
+            )
 
-            if changed:
+            if changed or idle_keepalive:
                 sent = False
                 if self.local_device:
-                    sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
+                    if changed:
+                        sent = self.local_device.send_hsv(h_tuya, s_tuya, v_tuya)
+                    else:
+                        # Screen is static: send 0x09 heartbeat (or re-send HSV) to keep MCU awake
+                        sent = self.local_device.poll_and_heartbeat(now)
+
                     if sent:
                         self.local_offline_since = 0.0
-                        self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
+                        self.mode = "Local Ethernet" if (getattr(self.local_device, 'bind_ip', None) and self.local_device.bind_fail_count < 2) else "Local Wi-Fi"
 
-                if not sent and self.cloud_client:
-                    now = time.time()
+                if not sent and changed and self.cloud_client:
                     if self.local_offline_since == 0.0:
                         self.local_offline_since = now
-                    # Only fall back to Cloud if local has been down >5s (prevents HTTPS stalls on brief Wi-Fi blips)
                     if not self.local_device or (now - self.local_offline_since >= 5.0):
                         self._dispatch_cloud("hsv", (h_tuya, s_tuya, v_tuya))
                         sent = True
 
-                if sent:
+                if sent and changed:
                     self.last_sent_hsv = (h_tuya, s_tuya, v_tuya)
                     self.last_sent_white = -1
-                else:
+                elif not sent:
                     self.mode = "Disconnected"
+            elif self.local_device and self.local_device.is_connected:
+                # Drain delayed ACKs on every tick and immediately detect if bulb closed socket
+                if not self.local_device.poll_and_heartbeat(now):
+                    self.local_device.connect()
 
             elapsed = time.time() - loop_start
             sleep_for = interval - elapsed
