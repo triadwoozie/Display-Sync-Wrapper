@@ -715,12 +715,12 @@ class TuyaCloudClient:
         try:
             resp = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=2.5)
             data = resp.json()
-            if data.get("success"):
+            if data.get("success") and data.get("result") is not False:
                 return True
             if data.get("code") in (1010, 1011, 1012):
                 self.get_token(force_refresh=True)
                 return False
-            if not self.use_legacy_code and data.get("code") in (1106, 2001, 2008):
+            if not self.use_legacy_code and data.get("code") in (1106, 2008):
                 self.use_legacy_code = True
                 return self.send_color(h, s, v)
             return False
@@ -760,7 +760,8 @@ class TuyaCloudClient:
 
         try:
             resp = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=2.5)
-            return bool(resp.json().get("success"))
+            data = resp.json()
+            return bool(data.get("success") and data.get("result") is not False)
         except Exception:
             return False
 
@@ -793,7 +794,8 @@ class TuyaCloudClient:
 
         try:
             resp = requests.post(f"{self.base_url}{path}", headers=headers, data=body_str, timeout=2.5)
-            return bool(resp.json().get("success"))
+            data = resp.json()
+            return bool(data.get("success") and data.get("result") is not False)
         except Exception:
             return False
 
@@ -1029,8 +1031,6 @@ class TuyaBulbSync:
             if success:
                 self.local_offline_since = 0.0
                 self.mode = "Local Ethernet" if getattr(self.local_device, 'bind_ip', None) else "Local Wi-Fi"
-            elif self.cloud_client:
-                self.mode = "Cloud OpenAPI"
             else:
                 self.mode = "Disconnected"
             return success
@@ -1124,6 +1124,8 @@ class TuyaBulbSync:
 
             if ok and (not self.local_device or not self.local_device.is_connected):
                 self.mode = "Cloud OpenAPI"
+            elif not ok and (not self.local_device or not self.local_device.is_connected):
+                self.mode = "Disconnected"
 
     def update_frame(self, arr: np.ndarray):
         """
@@ -1199,6 +1201,9 @@ class TuyaBulbSync:
                         elif detected_eth and not old_eth:
                             print(f"\n[*] Phone plugged in: switched bulb streaming to USB Ethernet ({detected_eth})")
                     elif self.local_device and not self.local_device.is_connected:
+                        self.local_device.connect()
+                else:
+                    if self.local_device and not self.local_device.is_connected:
                         self.local_device.connect()
 
             with self.lock:
